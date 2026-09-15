@@ -1,0 +1,38 @@
+name: Verify and build
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: 24, cache: npm}
+      - run: npm ci
+      - run: npm run types -w signaling
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npx wrangler deploy --dry-run --config signaling/wrangler.jsonc
+      - name: Signaling integration
+        run: |
+          npm run dev:signaling > /tmp/signaling.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/health && break; sleep 1; done
+          npm run test:integration
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - name: Build native host and test
+        shell: pwsh
+        run: ./scripts/build-host.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-monitor-windows-x64
+          path: |
+            build/host/browser-monitor.exe
+            README.md
+            docs/

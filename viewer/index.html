@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Browser Monitor</title>
+  </head>
+  <body>
+    <header>
+      <strong>Browser Monitor</strong
+      ><span id="status" role="status">Ready to connect</span
+      ><button id="fullscreen" disabled>Fullscreen</button
+      ><button id="disconnect" disabled>Disconnect</button>
+    </header>
+    <main>
+      <section id="pairing">
+        <h1>Your second screen.<br />In a browser.</h1>
+        <p>
+          Start Browser Monitor on your Windows PC, then enter its pairing
+          details here.
+        </p>
+        <form id="join">
+          <label
+            >Signaling server<input
+              id="server"
+              type="url"
+              required
+              placeholder="https://browser-monitor-signaling.…workers.dev"
+              autocomplete="url"
+          /></label>
+          <div class="row">
+            <label
+              >Room code<input
+                id="room"
+                required
+                maxlength="8"
+                pattern="[A-HJ-NP-Z2-9]{8}"
+                placeholder="ABCDEFGH"
+                autocomplete="off" /></label
+            ><label
+              >Session secret<input
+                id="secret"
+                required
+                type="password"
+                minlength="64"
+                maxlength="64"
+                autocomplete="off"
+                placeholder="Paste the session secret"
+            /></label>
+          </div>
+          <button type="submit">Connect display</button>
+        </form>
+        <details id="test-tools">
+          <summary>Browser sender test</summary>
+          <p>
+            Use this on the sending PC to test pairing and WebRTC before running
+            the native host.
+          </p>
+          <button id="test-host">Share a screen</button
+          ><button id="test-pattern">Stream test pattern</button
+          ><output id="test-pairing"></output>
+        </details>
+      </section>
+      <section id="screen" hidden>
+        <video id="video" autoplay playsinline muted></video
+        ><button id="play" hidden>Play display</button>
+      </section>
+      <pre id="error" role="alert"></pre>
+    </main>
+    <footer>
+      <span>Direct WebRTC · No media relay</span>
+      <details>
+        <summary>Diagnostics</summary>
+        <pre id="stats">No connection</pre>
+      </details>
+    </footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

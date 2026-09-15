@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.deps/
+.wrangler/
+.env
+.env.*
+!.env.example
+*.user
+*.log
+benchmarks/results/
+!benchmarks/results/.gitkeep

@@ -1,0 +1,6 @@
+.deps
+build
+node_modules
+dist
+signaling/worker-configuration.d.ts
+package-lock.json

@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr const char* iceJson = R"json(@BM_ICE_JSON@)json";

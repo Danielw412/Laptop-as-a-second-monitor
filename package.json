@@ -1,0 +1,24 @@
+{
+  "name": "browser-monitor",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "viewer",
+    "signaling"
+  ],
+  "scripts": {
+    "build": "npm run build -w viewer",
+    "typecheck": "tsc -p viewer/tsconfig.json && tsc -p signaling/tsconfig.json",
+    "test": "vitest run",
+    "dev:viewer": "npm run dev -w viewer",
+    "dev:signaling": "npm run dev -w signaling",
+    "test:integration": "node tests/signaling.integration.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "prettier": "^3.9.6",
+    "typescript": "~5.9.3",
+    "vitest": "^5.0.0",
+    "ws": "^8.18.3"
+  }
+}
