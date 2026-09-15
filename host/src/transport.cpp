@@ -1,6 +1,8 @@
 #include "transport.hpp"
 #include "ice_config.hpp"
+#include "logging.hpp"
 #include <atomic>
+#include <bcrypt.h>
 #include <deque>
 #include <mutex>
 #include <rtc/plihandler.hpp>
@@ -10,46 +12,59 @@ namespace bm {
 using Json = nlohmann::json;
 namespace {
 class TestPacketLoss final : public rtc::MediaHandler {
-    unsigned every_; uint64_t packets_ = 0;
+    unsigned every_;
+    uint64_t packets_ = 0;
+
   public:
     std::atomic<uint64_t> dropped{0};
     explicit TestPacketLoss(unsigned every) : every_(every) {}
     void outgoing(rtc::message_vector &messages, const rtc::message_callback &) override {
         std::erase_if(messages, [&](const auto &m) {
-            if (m->type == rtc::Message::Control || !every_ || ++packets_ % every_) return false;
-            ++dropped; return true;
+            if (m->type == rtc::Message::Control || !every_ || ++packets_ % every_)
+                return false;
+            ++dropped;
+            return true;
         });
     }
 };
 std::string withoutCandidates(const std::string &sdp) {
-    std::istringstream input(sdp); std::string line, output;
-    while (std::getline(input,line)) if (!line.starts_with("a=candidate:") && !line.starts_with("a=end-of-candidates")) output += line + "\n";
+    std::istringstream input(sdp);
+    std::string line, output;
+    while (std::getline(input, line))
+        if (!line.starts_with("a=candidate:") && !line.starts_with("a=end-of-candidates"))
+            output += line + "\n";
     return output;
 }
 // MbedTLS does not automatically import the Windows trust store.
 std::string windowsRoots() {
     HCERTSTORE store = CertOpenSystemStoreW(0, L"ROOT");
-    if (!store) throw std::runtime_error("Cannot open Windows certificate roots");
+    if (!store)
+        throw std::runtime_error("Cannot open Windows certificate roots");
     std::string pem;
     PCCERT_CONTEXT certificate = nullptr;
     while ((certificate = CertEnumCertificatesInStore(store, certificate))) {
         DWORD size = 0;
-        if (CryptBinaryToStringA(certificate->pbCertEncoded, certificate->cbCertEncoded,
-                                CRYPT_STRING_BASE64HEADER, nullptr, &size)) {
+        if (CryptBinaryToStringA(certificate->pbCertEncoded, certificate->cbCertEncoded, CRYPT_STRING_BASE64HEADER,
+                                 nullptr, &size)) {
             std::string encoded(size, '\0');
             if (CryptBinaryToStringA(certificate->pbCertEncoded, certificate->cbCertEncoded,
-                                    CRYPT_STRING_BASE64HEADER, encoded.data(), &size)) {
+                                     CRYPT_STRING_BASE64HEADER, encoded.data(), &size)) {
                 encoded.resize(size);
                 pem += encoded;
             }
         }
     }
     CertCloseStore(store, 0);
-    if (pem.empty()) throw std::runtime_error("Windows certificate root store is empty");
+    if (pem.empty())
+        throw std::runtime_error("Windows certificate root store is empty");
     return pem;
 }
-constexpr const char *directFailure = "Direct WebRTC connection failed.\nThis network may block peer-to-peer "
-                                      "WebRTC traffic.\nTURN relay is not enabled.";
+void systemRandom(uint8_t *out, size_t n) {
+    if (BCryptGenRandom(nullptr, out, ULONG(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+        throw std::runtime_error("Secure random generator unavailable");
+}
+constexpr const char *directFailure = "Direct WebRTC connection failed. This network may block peer-to-peer "
+                                      "WebRTC traffic. TURN relay is not enabled.";
 struct Mailbox {
     std::mutex mutex;
     std::deque<Json> messages;
@@ -71,23 +86,85 @@ class Transport final : public ITransport {
     std::shared_ptr<TestPacketLoss> testLoss_;
     bool testDroppedKeyframe_ = false;
     std::string url_, room_, secret_, generation_;
+    std::function<void(const TransportEvent &)> events_;
+    PairingCodes codes_;
     uint64_t socketEpoch_ = 0, peerEpoch_ = 0;
     std::vector<rtc::Candidate> candidates_;
     bool remote_ = false, fatal_ = false, reported_ = false;
+    SignalingState signaling_ = SignalingState::Disconnected;
+    bool viewer_ = false, webrtcUp_ = false;
+    std::string rejection_;
     Clock::time_point retry_ = Clock::now(), deadline_ = Clock::now(), lastTelemetry_ = Clock::now();
     unsigned attempts_ = 0;
     uint64_t frames_ = 0, bytes_ = 0, dropped_ = 0;
     Clock::time_point peerStart_{};
+    std::optional<Clock::time_point> connectedSince_;
     Json timings_ = Json::object();
     uint64_t keyframeRequests_ = 0, keyframesSent_ = 0;
     std::optional<Clock::time_point> keyframeRequested_;
     BitrateController adaptation_;
     Json receiver_ = Json::object();
+    mutable std::mutex pairingMutex_;
+    PairingSnapshot pairingSnapshot_;
+    void emit(TransportEventType type, std::string detail = {}) {
+        if (events_)
+            events_({type, std::move(detail)});
+    }
+    void setSignaling(SignalingState s) {
+        if (signaling_ == s)
+            return;
+        signaling_ = s;
+        switch (s) {
+        case SignalingState::Connecting:
+            emit(TransportEventType::SignalingConnecting);
+            break;
+        case SignalingState::Connected:
+            emit(TransportEventType::SignalingConnected);
+            break;
+        case SignalingState::Disconnected:
+            emit(TransportEventType::SignalingDisconnected);
+            break;
+        case SignalingState::Rejected:
+            emit(TransportEventType::SignalingRejected, rejection_);
+            break;
+        }
+    }
+    void setViewer(bool present) {
+        if (viewer_ == present)
+            return;
+        viewer_ = present;
+        emit(present ? TransportEventType::ViewerJoined : TransportEventType::ViewerLeft);
+    }
+    void setWebRtc(bool up) {
+        if (webrtcUp_ == up)
+            return;
+        webrtcUp_ = up;
+        if (up)
+            connectedSince_ = Clock::now();
+        else
+            connectedSince_.reset();
+        emit(up ? TransportEventType::WebRtcConnected : TransportEventType::WebRtcDisconnected);
+    }
+    void updatePairingSnapshot() {
+        std::lock_guard lock(pairingMutex_);
+        pairingSnapshot_.code = codes_.current();
+        pairingSnapshot_.rotatesAt = codes_.currentRotatesAt();
+        pairingSnapshot_.generation = codes_.generation();
+    }
     void signal(Json j) {
         if (socket_ && socket_->isOpen()) {
             j["generation"] = generation_;
             socket_->send(j.dump());
         }
+    }
+    /// Sends the hashes of every currently valid code with their remaining lifetimes. Codes never leave the host.
+    void publishCodes() {
+        if (!socket_ || !socket_->isOpen() || signaling_ != SignalingState::Connected)
+            return;
+        Json list = Json::array();
+        for (auto &r : codes_.registrations(Clock::now()))
+            list.push_back({{"hash", r.hash}, {"ttlMs", r.ttlMs}});
+        socket_->send(Json{{"type", "codes"}, {"codes", list}}.dump());
     }
     void reset() {
         ++peerEpoch_;
@@ -99,6 +176,7 @@ class Transport final : public ITransport {
         rtp_.reset();
         candidates_.clear();
         remote_ = false;
+        setWebRtc(false);
     }
     void connectSocket() {
         if (socket_)
@@ -123,6 +201,7 @@ class Transport final : public ITransport {
                 }
             }
         });
+        setSignaling(SignalingState::Connecting);
         socket_->open(url_ + "/room/" + room_);
         retry_ = Clock::time_point::max();
     }
@@ -164,7 +243,8 @@ class Transport final : public ITransport {
         packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(512));
         packetizer->addToChain(std::make_shared<rtc::PliHandler>([box] { box->idr = true; }));
         testLoss_ = std::make_shared<TestPacketLoss>(test_.dropEvery);
-        if (test_.dropEvery) packetizer->addToChain(testLoss_);
+        if (test_.dropEvery)
+            packetizer->addToChain(testLoss_);
         track_->setMediaHandler(packetizer);
         track_->onOpen([box] { box->idr = true; });
         rtc::DataChannelInit init;
@@ -182,12 +262,17 @@ class Transport final : public ITransport {
         peer_->setLocalDescription();
         deadline_ = Clock::now() + std::chrono::milliseconds(ice["connectionTimeoutMs"].get<int>());
         reported_ = false;
-        std::cout << "Negotiating direct WebRTC\n";
+        logInfo("Negotiating direct WebRTC");
     }
 
   public:
-    Transport(std::string server, std::string room, std::string secret, TransportTestOptions test)
-        : test_(test), url_(std::move(server)), room_(std::move(room)), secret_(std::move(secret)) {
+    Transport(std::string server, std::string secret, std::function<void(const TransportEvent &)> events,
+              TransportTestOptions test, BitratePlan plan)
+        : test_(test), url_(std::move(server)), secret_(std::move(secret)), events_(std::move(events)),
+          codes_(systemRandom, Clock::now()), adaptation_(plan.initial, plan.minimum, plan.maximum) {
+        if (!validSecret(secret_))
+            throw std::runtime_error("Invalid host credential");
+        room_ = roomIdFor(secret_);
         while (!url_.empty() && url_.back() == '/')
             url_.pop_back();
         if (url_.starts_with("https://"))
@@ -197,16 +282,26 @@ class Transport final : public ITransport {
         if (!url_.starts_with("wss://") && !url_.starts_with("ws://127.0.0.1:") &&
             !url_.starts_with("ws://localhost:"))
             throw std::runtime_error("Signaling requires HTTPS/WSS except localhost");
-        if (test.dropEvery || test.dropFirstKeyframe || test.blockIce) std::cout << "TEST MODE: deliberate media loss or ICE blocking enabled\n";
+        if (test.dropEvery || test.dropFirstKeyframe || test.blockIce)
+            logWarning("TEST MODE: deliberate media loss or ICE blocking enabled");
+        updatePairingSnapshot();
     }
     ~Transport() {
+        // No state events from a dying transport: the engine reports Stopped, which resets the viewer state.
+        events_ = nullptr;
         reset();
         if (socket_)
             socket_->close();
     }
     void poll() override {
-        if (!fatal_ && Clock::now() >= retry_)
+        const auto now = Clock::now();
+        if (!fatal_ && now >= retry_)
             connectSocket();
+        if (codes_.tick(now)) {
+            updatePairingSnapshot();
+            publishCodes();
+            emit(TransportEventType::CodeRotated);
+        }
         std::deque<Json> messages;
         {
             std::lock_guard lock(mailbox_->mutex);
@@ -221,41 +316,58 @@ class Transport final : public ITransport {
                 const auto event = m["event"].get<std::string>();
                 if (event == "socket-open")
                     socket_->send(
-                        Json{{"type", "auth"}, {"version", 1}, {"role", "host"}, {"secret", secret_}}.dump());
+                        Json{{"type", "auth"}, {"version", 2}, {"role", "host"}, {"secret", secret_}}.dump());
                 else if (event == "socket-close") {
                     reset();
+                    setViewer(false);
+                    if (signaling_ != SignalingState::Rejected)
+                        setSignaling(SignalingState::Disconnected);
                     if (retry_ == Clock::time_point::max())
                         retry_ = Clock::now() + std::chrono::milliseconds(
                                                     std::min(10000u, 500u << std::min(attempts_++, 5u)));
-                    std::cout << "Signaling disconnected; retrying\n";
+                    if (!fatal_)
+                        logInfo("Signaling disconnected; retrying");
                 } else if (event == "signal") {
                     auto &body = m["body"];
                     auto type = body.value("type", "");
                     if (type == "authenticated") {
                         attempts_ = 0;
-                        std::cout << "Room authenticated; waiting for viewer\n";
+                        setSignaling(SignalingState::Connected);
+                        publishCodes();
+                        logInfo("Room authenticated; waiting for receiver");
                     } else if (type == "error") {
-                        std::cerr << "Pairing rejected: " << body.value("code", "unknown") << '\n';
-                        fatal_ = body.value("code", "") != "expired" && body.value("code", "") != "role-occupied";
+                        const auto code = body.value("code", "unknown");
+                        logWarning("Signaling rejected the host: " + code);
+                        fatal_ = code != "expired" && code != "role-occupied" && code != "rate-limit";
                         reset();
+                        if (fatal_) {
+                            rejection_ = code;
+                            setSignaling(SignalingState::Rejected);
+                        }
                         socket_->close();
                     } else if (type == "ready") {
                         generation_ = body.at("generation").get<std::string>();
+                        setViewer(true);
                         createPeer();
                     } else if (type == "peer-left") {
                         reset();
-                        std::cout << "Viewer left; waiting for reconnect\n";
+                        setViewer(false);
+                        logInfo("Receiver left; waiting for it to return");
                     } else if (peer_ && body.value("generation", "") == generation_) {
                         if (type == "answer") {
-                            peer_->setRemoteDescription(
-                                rtc::Description(test_.blockIce ? withoutCandidates(body.at("sdp").get<std::string>()) : body.at("sdp").get<std::string>(), "answer"));
+                            peer_->setRemoteDescription(rtc::Description(
+                                test_.blockIce ? withoutCandidates(body.at("sdp").get<std::string>())
+                                               : body.at("sdp").get<std::string>(),
+                                "answer"));
                             remote_ = true;
-                            timings_["answer_ms"] = std::chrono::duration<double,std::milli>(Clock::now()-peerStart_).count();
+                            timings_["answer_ms"] =
+                                std::chrono::duration<double, std::milli>(Clock::now() - peerStart_).count();
                             for (auto &c : candidates_)
                                 peer_->addRemoteCandidate(c);
                             candidates_.clear();
                         } else if (type == "ice") {
-                            if (test_.blockIce) continue;
+                            if (test_.blockIce)
+                                continue;
                             rtc::Candidate c(body.at("candidate").get<std::string>(),
                                              body.at("mid").get<std::string>());
                             if (remote_)
@@ -265,40 +377,48 @@ class Transport final : public ITransport {
                         }
                     }
                 } else if (event == "local-description")
-                    signal({{"type", "offer"}, {"sdp", test_.blockIce ? withoutCandidates(m["sdp"].get<std::string>()) : m["sdp"].get<std::string>()}});
+                    signal({{"type", "offer"},
+                            {"sdp", test_.blockIce ? withoutCandidates(m["sdp"].get<std::string>())
+                                                   : m["sdp"].get<std::string>()}});
                 else if (event == "local-ice" && !test_.blockIce)
                     signal({{"type", "ice"}, {"candidate", m["candidate"]}, {"mid", m["mid"]}});
                 else if (event == "peer-state") {
                     auto s = rtc::PeerConnection::State(m["state"].get<int>());
                     if (s == rtc::PeerConnection::State::Connected) {
-                        std::cout << "Direct WebRTC connected\n";
+                        logInfo("Direct WebRTC connected");
                         reported_ = false;
-                        timings_["connected_ms"] = std::chrono::duration<double,std::milli>(Clock::now()-peerStart_).count();
-                    } else if (s == rtc::PeerConnection::State::Disconnected)
+                        timings_["connected_ms"] =
+                            std::chrono::duration<double, std::milli>(Clock::now() - peerStart_).count();
+                        setWebRtc(true);
+                    } else if (s == rtc::PeerConnection::State::Disconnected) {
                         deadline_ = Clock::now() + std::chrono::seconds(20);
-                    else if (s == rtc::PeerConnection::State::Failed) {
-                        std::cerr << directFailure << '\n';
+                        setWebRtc(false);
+                    } else if (s == rtc::PeerConnection::State::Failed) {
+                        logWarning(directFailure);
                         reported_ = true;
-                    }
+                        setWebRtc(false);
+                    } else if (s == rtc::PeerConnection::State::Closed)
+                        setWebRtc(false);
                 } else if (event == "telemetry") {
                     const auto &b = m["body"];
                     if (b.value("type", "") != "telemetry" ||
                         Clock::now() - lastTelemetry_ < std::chrono::milliseconds(500))
                         continue;
                     receiver_ = b;
-                    if (!b.contains("loss") || !b["loss"].is_number() || !b.contains("rttMs") || !b["rttMs"].is_number() || !b.contains("jitterMs") || !b["jitterMs"].is_number()) continue;
+                    if (!b.contains("loss") || !b["loss"].is_number() || !b.contains("rttMs") ||
+                        !b["rttMs"].is_number() || !b.contains("jitterMs") || !b["jitterMs"].is_number())
+                        continue;
                     double loss = b.at("loss").get<double>(), rtt = b.at("rttMs").get<double>(),
                            jitter = b.at("jitterMs").get<double>();
                     adaptation_.update(loss, rtt, jitter);
-                    receiver_ = b;
                     lastTelemetry_ = Clock::now();
                 }
             } catch (const std::exception &) {
-                std::cerr << "Rejected invalid peer message or negotiation failed\n";
+                logWarning("Rejected invalid peer message or negotiation failed");
             }
         }
         if (peer_ && !connected() && Clock::now() > deadline_ && !reported_) {
-            std::cerr << directFailure << '\n';
+            logWarning(directFailure);
             reported_ = true;
         }
     }
@@ -308,7 +428,7 @@ class Transport final : public ITransport {
     bool send(const Encoded &frame) override {
         if (test_.dropFirstKeyframe && !testDroppedKeyframe_ && frame.keyframe) {
             testDroppedKeyframe_ = true;
-            std::cout << "TEST MODE: discarded first keyframe to exercise browser PLI\n";
+            logWarning("TEST MODE: discarded first keyframe to exercise browser PLI");
             return false;
         }
         if (!connected() || track_->bufferedAmount() > 128 * 1024) {
@@ -323,11 +443,19 @@ class Transport final : public ITransport {
             if (ok) {
                 ++frames_;
                 bytes_ += frame.bytes.size();
-                if (!timings_.contains("first_sent_ms")) timings_["first_sent_ms"] = std::chrono::duration<double,std::milli>(Clock::now()-peerStart_).count();
+                if (!timings_.contains("first_sent_ms"))
+                    timings_["first_sent_ms"] =
+                        std::chrono::duration<double, std::milli>(Clock::now() - peerStart_).count();
                 if (frame.keyframe) {
                     ++keyframesSent_;
-                    if (!timings_.contains("first_keyframe_ms")) timings_["first_keyframe_ms"] = std::chrono::duration<double,std::milli>(Clock::now()-peerStart_).count();
-                    if (keyframeRequested_) { timings_["keyframe_response_ms"] = std::chrono::duration<double,std::milli>(Clock::now()-*keyframeRequested_).count(); keyframeRequested_.reset(); }
+                    if (!timings_.contains("first_keyframe_ms"))
+                        timings_["first_keyframe_ms"] =
+                            std::chrono::duration<double, std::milli>(Clock::now() - peerStart_).count();
+                    if (keyframeRequested_) {
+                        timings_["keyframe_response_ms"] =
+                            std::chrono::duration<double, std::milli>(Clock::now() - *keyframeRequested_).count();
+                        keyframeRequested_.reset();
+                    }
                 }
             } else {
                 ++dropped_;
@@ -341,9 +469,11 @@ class Transport final : public ITransport {
         }
     }
     bool consumeKeyframeRequest() override {
-        if (!mailbox_->idr.exchange(false)) return false;
+        if (!mailbox_->idr.exchange(false))
+            return false;
         ++keyframeRequests_;
-        if (!keyframeRequested_) keyframeRequested_ = Clock::now();
+        if (!keyframeRequested_)
+            keyframeRequested_ = Clock::now();
         return true;
     }
     uint32_t targetBitrate() const override {
@@ -355,16 +485,99 @@ class Transport final : public ITransport {
     }
     Json stats() const override {
         return {{"sent_frames", frames_},
-                {"timings", timings_}, {"keyframe_requests",keyframeRequests_}, {"keyframes_sent",keyframesSent_},
+                {"timings", timings_},
+                {"keyframe_requests", keyframeRequests_},
+                {"keyframes_sent", keyframesSent_},
                 {"test_rtp_dropped", testLoss_ ? testLoss_->dropped.load() : 0},
                 {"encoded_bytes_sent", bytes_},
                 {"transport_dropped", dropped_},
                 {"transport_buffer_bytes", track_ ? track_->bufferedAmount() : 0},
                 {"receiver", receiver_}};
     }
+    SignalingState signaling() const override {
+        return signaling_;
+    }
+    bool viewerPresent() const override {
+        return viewer_;
+    }
+    void disconnectViewer() override {
+        if (socket_ && socket_->isOpen() && signaling_ == SignalingState::Connected)
+            socket_->send(Json{{"type", "kick"}}.dump());
+        reset();
+        setViewer(false);
+        rotateCode();
+        logInfo("Receiver disconnected by the host");
+    }
+    void rotateCode() override {
+        codes_.rotate(Clock::now());
+        updatePairingSnapshot();
+        publishCodes();
+        emit(TransportEventType::CodeRotated);
+    }
+    PairingSnapshot pairing() const override {
+        std::lock_guard lock(pairingMutex_);
+        return pairingSnapshot_;
+    }
+    void fillMetrics(MetricsSnapshot &m) const override {
+        m.sentFrames = frames_;
+        m.sentBytes = bytes_;
+        m.transportDropped = dropped_;
+        m.keyframeRequests = keyframeRequests_;
+        m.keyframesSent = keyframesSent_;
+        m.bufferBytes = track_ ? track_->bufferedAmount() : 0;
+        m.targetBitrate = adaptation_.bitrate();
+        m.connectedSince = connectedSince_;
+        static const char *const states[] = {"disconnected", "connecting", "connected", "rejected"};
+        m.signalingState = states[size_t(signaling_)];
+        if (!peer_)
+            m.webrtcState = viewer_ ? "negotiating" : "none";
+        else {
+            switch (peer_->state()) {
+            case rtc::PeerConnection::State::New:
+                m.webrtcState = "new";
+                break;
+            case rtc::PeerConnection::State::Connecting:
+                m.webrtcState = "connecting";
+                break;
+            case rtc::PeerConnection::State::Connected:
+                m.webrtcState = "connected";
+                break;
+            case rtc::PeerConnection::State::Disconnected:
+                m.webrtcState = "disconnected";
+                break;
+            case rtc::PeerConnection::State::Failed:
+                m.webrtcState = "failed";
+                break;
+            case rtc::PeerConnection::State::Closed:
+                m.webrtcState = "closed";
+                break;
+            }
+        }
+        if (timings_.contains("connected_ms"))
+            m.connectMs = timings_["connected_ms"].get<double>();
+        if (timings_.contains("first_keyframe_ms"))
+            m.firstKeyframeMs = timings_["first_keyframe_ms"].get<double>();
+        auto number = [&](const char *key) -> std::optional<double> {
+            if (receiver_.contains(key) && receiver_[key].is_number())
+                return receiver_[key].get<double>();
+            return std::nullopt;
+        };
+        m.viewerFps = number("fps");
+        m.viewerBitrate = number("bitrate");
+        m.rttMs = number("rttMs");
+        m.loss = number("loss");
+        m.jitterMs = number("jitterMs");
+        if (auto v = number("dropped"))
+            m.viewerDropped = uint64_t(std::max(0.0, *v));
+        if (auto v = number("decoded"))
+            m.viewerDecoded = uint64_t(std::max(0.0, *v));
+        m.pairing = pairing();
+    }
 };
 } // namespace
-std::unique_ptr<ITransport> webRtc(std::string server, std::string room, std::string secret, TransportTestOptions test) {
-    return std::make_unique<Transport>(std::move(server), std::move(room), std::move(secret), test);
+std::unique_ptr<ITransport> webRtc(std::string server, std::string hostSecret,
+                                   std::function<void(const TransportEvent &)> events, TransportTestOptions test,
+                                   BitratePlan plan) {
+    return std::make_unique<Transport>(std::move(server), std::move(hostSecret), std::move(events), test, plan);
 }
 } // namespace bm

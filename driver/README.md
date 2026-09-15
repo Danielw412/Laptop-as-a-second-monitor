@@ -4,8 +4,12 @@ A single **1920×1080 @ 60 Hz** virtual monitor for Windows 11, built on Microso
 [`microsoft/Windows-driver-samples/video/IndirectDisplay`](https://github.com/microsoft/Windows-driver-samples/tree/main/video/IndirectDisplay)
 at commit `97429c5623590d52f001249460daf43e6749d777` (MS-PL, see `LICENSE`).
 
-The host (`browser-monitor.exe`) needs no changes. The monitor appears as a normal `\\.\DISPLAYn` output, and the
-existing DXGI duplication / WGC capture path can select it with `--display`.
+The host needs no changes. The monitor appears as a normal `\\.\DISPLAYn` output; the app finds it by its EDID
+identity (`BMV0001` / "BrowserMon") and the bench tool selects it with `--browsermon` or an explicit `--display`.
+
+In daily use the device is created by `BrowserMonitorDisplay.exe` through the scheduled task that Browser Monitor's
+one-time setup registers (see the top-level README). `BrowserMonitorIddApp.exe` remains as the standalone
+console version of the same thing for driver testing.
 
 ## Changes from the sample
 
@@ -81,8 +85,9 @@ Secure Boot, driver-signature-enforcement or BitLocker change is needed.
   product `0001`, name `BrowserMon`.
 - `QueryDisplayConfig` / `EnumDisplaySettings`: target `BrowserMon`, 1920×1080, 60 Hz, only mode `1920x1080@60`,
   non-primary, on adapter **Browser Monitor Virtual Display**.
-- `build/host/browser-monitor.exe --list` shows it as a secondary display on the render GPU, e.g.
-  `\\.\DISPLAY5 | Intel(R) Iris(R) Xe Graphics | 1920x1080 | secondary`.
+- `build/host/browser-monitor-bench.exe --list` shows it as a secondary display on the render GPU, e.g.
+  `\\.\DISPLAY5 | Intel(R) Iris(R) Xe Graphics | 1920x1080 | secondary`, followed by a `BrowserMon:` line with
+  its device path.
 
 The `\\.\DISPLAYn` number is not stable: it changed from `DISPLAY5` to `DISPLAY6` after an uninstall/reinstall. The
 monitor device path (`\\?\DISPLAY#BMV0001#1&1eee597c&0&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}` on the test
@@ -96,9 +101,8 @@ WGC texture → D3D11 video processor BGRA→NV12 → `MFCreateDXGISurfaceBuffer
 `video_path=GPU` and `CPU readback: no`; only the compressed H.264 bitstream is read on the CPU.
 
 ```powershell
-$d = '\\.\DISPLAY5'   # from --list
-./build/host/browser-monitor.exe --display $d --capture dxgi --mode capture-encode --pattern --seconds 20 --csv results.csv
-./build/host/browser-monitor.exe --display $d --capture wgc  --mode capture-encode --pattern --seconds 20
+./build/host/browser-monitor-bench.exe --browsermon --capture dxgi --mode capture-encode --pattern --seconds 20 --csv results.csv
+./build/host/browser-monitor-bench.exe --browsermon --capture wgc  --mode capture-encode --pattern --seconds 20
 ```
 
 `--pattern` draws a moving bar on the selected display so there are frames to capture. Measured on 2026-09-15:

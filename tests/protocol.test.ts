@@ -1,57 +1,88 @@
 import { describe, it, expect } from "vitest";
-import { parseClient, ROOM_RE } from "../shared/protocol";
+import {
+  CODE_RE,
+  ROOM_RE,
+  normalizeCode,
+  parseClient,
+  roomForSecret,
+  sha256Hex,
+} from "../shared/protocol";
 const generation = "12345678-1234-1234-1234-123456789012";
-describe("signaling protocol", () => {
-  it("authenticates with a separate 256-bit secret", () =>
+describe("signaling protocol v2", () => {
+  it("authenticates a host with its 256-bit credential", () =>
     expect(
-      parseClient(
-        JSON.stringify({
-          type: "auth",
-          version: 1,
-          role: "host",
-          secret: "a".repeat(64),
-        }),
-      ).type,
+      parseClient(JSON.stringify({ type: "auth", version: 2, role: "host", secret: "a".repeat(64) })).type,
     ).toBe("auth"));
+  it("authenticates a viewer by one-time ticket or by resume token, never by secret", () => {
+    expect(
+      parseClient(JSON.stringify({ type: "auth", version: 2, role: "viewer", ticket: "c".repeat(64) })),
+    ).toEqual({ type: "auth", version: 2, role: "viewer", ticket: "c".repeat(64) });
+    expect(
+      parseClient(JSON.stringify({ type: "auth", version: 2, role: "viewer", token: "b".repeat(64) })),
+    ).toEqual({ type: "auth", version: 2, role: "viewer", token: "b".repeat(64) });
+    expect(() => parseClient(JSON.stringify({ type: "auth", version: 2, role: "viewer" }))).toThrow();
+    expect(() =>
+      parseClient(
+        JSON.stringify({ type: "auth", version: 2, role: "viewer", ticket: "c".repeat(64), token: "b".repeat(64) }),
+      ),
+    ).toThrow();
+  });
   it.each([
     "{}",
     "null",
     "[]",
     '{"type":"video"}',
-    JSON.stringify({
-      type: "auth",
-      version: 1,
-      role: "viewer",
-      secret: "ABCDEFGH",
-    }),
+    JSON.stringify({ type: "auth", version: 1, role: "host", secret: "a".repeat(64) }),
+    JSON.stringify({ type: "auth", version: 2, role: "host", secret: "ABCDEF" }),
+    JSON.stringify({ type: "auth", version: 2, role: "viewer", token: "short" }),
+    JSON.stringify({ type: "auth", version: 2, role: "viewer", secret: "a".repeat(64) }),
+    JSON.stringify({ type: "codes", codes: [{ hash: "zz", ttlMs: 1000 }] }),
+    JSON.stringify({ type: "codes", codes: [{ hash: "a".repeat(64), ttlMs: 0 }] }),
+    JSON.stringify({ type: "codes", codes: [{ hash: "a".repeat(64), ttlMs: 999_999_999 }] }),
+    JSON.stringify({ type: "codes", codes: [1, 2, 3] }),
     "a".repeat(25000),
-  ])("rejects invalid input %s", (raw) =>
-    expect(() => parseClient(raw)).toThrow(),
-  );
+  ])("rejects invalid input %s", (raw) => expect(() => parseClient(raw)).toThrow());
+  it("accepts at most two code registrations", () => {
+    const code = { hash: "c".repeat(64), ttlMs: 135000 };
+    expect(parseClient(JSON.stringify({ type: "codes", codes: [code, code] }))).toEqual({
+      type: "codes",
+      codes: [code, code],
+    });
+    expect(() => parseClient(JSON.stringify({ type: "codes", codes: [code, code, code] }))).toThrow();
+  });
+  it("parses kick", () => expect(parseClient('{"type":"kick"}')).toEqual({ type: "kick" }));
   it("validates and strips unknown fields", () =>
     expect(
-      parseClient(
-        JSON.stringify({
-          type: "offer",
-          generation,
-          sdp: "v=0\r\n",
-          secret: "do not forward",
-        }),
-      ),
+      parseClient(JSON.stringify({ type: "offer", generation, sdp: "v=0\r\n", secret: "do not forward" })),
     ).toEqual({ type: "offer", generation, sdp: "v=0\r\n" }));
-  it("rejects invalid room alphabet", () => {
-    expect(ROOM_RE.test("ABCDEFGH")).toBe(true);
-    expect(ROOM_RE.test("IIII0000")).toBe(false);
-  });
   it("rejects arbitrary data in ICE", () =>
     expect(() =>
-      parseClient(
-        JSON.stringify({
-          type: "ice",
-          generation,
-          candidate: "video",
-          mid: "0",
-        }),
-      ),
+      parseClient(JSON.stringify({ type: "ice", generation, candidate: "video", mid: "0" })),
     ).toThrow());
+});
+describe("pairing codes", () => {
+  it("uses the 32-symbol alphabet without I, O, 0 or 1", () => {
+    expect(CODE_RE.test("K7M4Q2")).toBe(true);
+    expect(CODE_RE.test("K7M4Q")).toBe(false);
+    expect(CODE_RE.test("K7M4Q21")).toBe(false);
+    expect(CODE_RE.test("I0O1AB")).toBe(false);
+    expect(CODE_RE.test("k7m4q2")).toBe(false);
+  });
+  it("normalizes user input", () => {
+    expect(normalizeCode("k7m 4q2")).toBe("K7M4Q2");
+    expect(normalizeCode("K7M-4Q2")).toBe("K7M4Q2");
+    expect(normalizeCode(" k7m4q2\n")).toBe("K7M4Q2");
+  });
+  it("derives the room id from the credential deterministically", async () => {
+    const secret = "0123456789abcdef".repeat(4);
+    const room = await roomForSecret(secret);
+    expect(ROOM_RE.test(room)).toBe(true);
+    expect(room).toBe((await sha256Hex(secret)).slice(0, 32));
+    expect(await roomForSecret("f".repeat(64))).not.toBe(room);
+  });
+  it("matches the host implementation's test vector", async () => {
+    // Shared with host/tests/logic_tests.cpp: SHA-256("abc") is the canonical vector.
+    expect(await sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    expect(await roomForSecret("abc")).toBe("ba7816bf8f01cfea414140de5dae2223");
+  });
 });

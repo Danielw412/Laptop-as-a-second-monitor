@@ -1,34 +1,45 @@
 import "./style.css";
-import { Session } from "./session";
+import { Session, type Credentials } from "./session";
 import { Dashboard } from "./dashboard";
-import { ROOM_RE, SECRET_RE } from "../../shared/protocol";
+import {
+  CODE_ALPHABET,
+  CODE_LENGTH,
+  CODE_RE,
+  ROOM_RE,
+  TOKEN_RE,
+  normalizeCode,
+  roomForSecret,
+} from "../../shared/protocol";
 const el = <T extends HTMLElement>(id: string) =>
   document.getElementById(id) as T;
 const server = el<HTMLInputElement>("server"),
-  room = el<HTMLInputElement>("room"),
-  secret = el<HTMLInputElement>("secret"),
+  code = el<HTMLInputElement>("code"),
   video = el<HTMLVideoElement>("video");
-server.value = import.meta.env.VITE_SIGNALING_URL ?? "";
+const defaultServer = import.meta.env.VITE_SIGNALING_URL ?? "https://browser-monitor-signaling.danielruoqiao.workers.dev";
+server.value = defaultServer;
 const dashboard = new Dashboard(el("dashboard-grid"));
-const storageKey = "browser-monitor-pairing";
-let resume = false;
+const storageKey = "browser-monitor-session";
+type Saved = { server: string; room: string; token: string };
+let saved: Saved | undefined;
 try {
-  const saved = JSON.parse(sessionStorage.getItem(storageKey) ?? "null");
-  if (saved && ROOM_RE.test(saved.room) && SECRET_RE.test(saved.secret)) {
-    server.value = saved.server; room.value = saved.room; secret.value = saved.secret; resume = true;
-  }
+  const parsed = JSON.parse(sessionStorage.getItem(storageKey) ?? "null");
+  if (parsed && typeof parsed.server === "string" && ROOM_RE.test(parsed.room) && TOKEN_RE.test(parsed.token))
+    saved = parsed;
 } catch { /* Session storage can be disabled by browser policy. */ }
 const params = new URLSearchParams(location.hash.slice(1));
-if (params.has("room")) room.value = params.get("room")!;
-if (params.has("secret")) secret.value = params.get("secret")!;
+if (params.has("code")) code.value = normalizeCode(params.get("code")!);
 if (params.has("server")) server.value = params.get("server")!;
 if (location.hash)
   history.replaceState(null, "", location.pathname + location.search);
 let session: Session | undefined;
 let patternTimer: ReturnType<typeof setInterval> | undefined;
 let frameCallback: number | undefined;
-function stop(forget = true) {
-  if (forget) { try { sessionStorage.removeItem(storageKey); } catch {} }
+function forget() {
+  saved = undefined;
+  try { sessionStorage.removeItem(storageKey); } catch {}
+}
+function stop(forgetSession = true) {
+  if (forgetSession) forget();
   session?.stop();
   session = undefined;
   clearInterval(patternTimer);
@@ -41,47 +52,58 @@ function stop(forget = true) {
   el<HTMLButtonElement>("fullscreen").disabled = true;
   el("status").textContent = "Disconnected";
 }
-function start(role: "host" | "viewer", stream?: MediaStream) {
-  if (!ROOM_RE.test(room.value.toUpperCase()) || !SECRET_RE.test(secret.value)) throw Error("Enter a valid room code and 64-character session secret.");
+function start(credentials: Credentials, stream?: MediaStream) {
   session?.stop();
   dashboard.reset();
   el("error").textContent = "";
   el<HTMLButtonElement>("disconnect").disabled = false;
-  session = new Session(
+  const current = new Session(
     server.value,
-    room.value.toUpperCase(),
-    secret.value,
-    role,
+    credentials,
     (s) => (el("status").textContent = s),
     (s) => (el("error").textContent = s),
     (s) => {
       if (frameCallback !== undefined) video.cancelVideoFrameCallback(frameCallback);
       video.srcObject = s;
-      const current = session;
       if ("requestVideoFrameCallback" in video)
-        frameCallback = video.requestVideoFrameCallback(() => { if (session === current) current?.presented(); });
+        frameCallback = video.requestVideoFrameCallback(() => { if (session === current) current.presented(); });
       el("pairing").hidden = true;
       el("screen").hidden = false;
       el<HTMLButtonElement>("fullscreen").disabled = false;
       void video.play().catch(() => (el("play").hidden = false));
     },
     (s) => dashboard.update(s),
+    (p) => {
+      if (credentials.role !== "viewer" || !p.room || !p.token) return;
+      saved = { server: server.value, room: p.room, token: p.token };
+      try { sessionStorage.setItem(storageKey, JSON.stringify(saved)); } catch {}
+    },
+    (reason) => {
+      // The host ended this session or rejected the credentials: never retry silently with the same ones.
+      if (session === current) stop(reason !== "viewer-occupied");
+      if (reason === "kicked") el("status").textContent = "Disconnected by the host. Enter the current code to reconnect.";
+    },
     stream,
   );
+  session = current;
   session.start();
-  if (role === "viewer") {
-    try { sessionStorage.setItem(storageKey, JSON.stringify({server:server.value, room:room.value.toUpperCase(), secret:secret.value})); } catch {}
-  }
 }
 el("join").addEventListener("submit", (e) => {
   e.preventDefault();
   try {
-    start("viewer");
+    const value = normalizeCode(code.value);
+    code.value = value;
+    if (!CODE_RE.test(value)) throw Error(`Enter the ${CODE_LENGTH}-character code shown in Browser Monitor.`);
+    forget();
+    start({ role: "viewer", code: value });
   } catch (e) {
-    el("error").textContent = String(e);
+    el("error").textContent = e instanceof Error ? e.message : String(e);
   }
 });
-room.addEventListener("input", () => (room.value = room.value.toUpperCase()));
+code.addEventListener("input", () => {
+  const value = normalizeCode(code.value).slice(0, CODE_LENGTH);
+  if (value !== code.value) code.value = value;
+});
 el("disconnect").onclick = () => stop();
 el("fullscreen").onclick = () =>
   void el("screen")
@@ -89,17 +111,14 @@ el("fullscreen").onclick = () =>
     .catch((e) => (el("error").textContent = String(e)));
 el("play").onclick = () =>
   void video.play().then(() => (el("play").hidden = true));
-function pairing() {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  room.value = Array.from(
-    crypto.getRandomValues(new Uint8Array(8)),
-    (v) => alphabet[v % 32],
-  ).join("");
-  secret.value = Array.from(crypto.getRandomValues(new Uint8Array(32)), (v) =>
-    v.toString(16).padStart(2, "0"),
-  ).join("");
-  el("test-pairing").textContent =
-    `Room: ${room.value}\nSecret: ${secret.value}`;
+function randomCode() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(CODE_LENGTH)), (v) => CODE_ALPHABET[v % 32]).join("");
+}
+async function testHost(stream: MediaStream) {
+  const secret = Array.from(crypto.getRandomValues(new Uint8Array(32)), (v) => v.toString(16).padStart(2, "0")).join("");
+  const pairingCode = randomCode();
+  el("test-pairing").textContent = `Pairing code: ${pairingCode}`;
+  start({ role: "host", room: await roomForSecret(secret), secret, code: pairingCode }, stream);
 }
 el("test-host").onclick = () =>
   void (async () => {
@@ -108,36 +127,38 @@ el("test-host").onclick = () =>
         video: { width: 1920, height: 1080, frameRate: 60 },
         audio: false,
       });
-      pairing();
-      start("host", stream);
+      await testHost(stream);
       stream.getVideoTracks()[0].onended = () => stop();
     } catch (e) {
       el("error").textContent = String(e);
     }
   })();
-el("test-pattern").onclick = () => {
-  try {
-    const canvas = document.createElement("canvas");
-    canvas.width = 1920;
-    canvas.height = 1080;
-    const ctx = canvas.getContext("2d")!;
-    let frame = 0;
-    clearInterval(patternTimer);
-    patternTimer = setInterval(() => {
-      ctx.fillStyle = "#15232b";
-      ctx.fillRect(0, 0, 1920, 1080);
-      ctx.fillStyle = "#adebc5";
-      ctx.fillRect((frame * 12) % 1920, 0, 100, 1080);
-      ctx.font = "80px monospace";
-      ctx.fillText(`Browser Monitor  ${frame++}`, 200, 500);
-    }, 1000 / 60);
-    pairing();
-    start("host", canvas.captureStream(60));
-  } catch (e) {
-    el("error").textContent = String(e);
-  }
-};
+el("test-pattern").onclick = () =>
+  void (async () => {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1920;
+      canvas.height = 1080;
+      const ctx = canvas.getContext("2d")!;
+      let frame = 0;
+      clearInterval(patternTimer);
+      patternTimer = setInterval(() => {
+        ctx.fillStyle = "#15232b";
+        ctx.fillRect(0, 0, 1920, 1080);
+        ctx.fillStyle = "#adebc5";
+        ctx.fillRect((frame * 12) % 1920, 0, 100, 1080);
+        ctx.font = "80px monospace";
+        ctx.fillText(`Browser Monitor  ${frame++}`, 200, 500);
+      }, 1000 / 60);
+      await testHost(canvas.captureStream(60));
+    } catch (e) {
+      el("error").textContent = String(e);
+    }
+  })();
 window.addEventListener("pagehide", () => stop(false));
-if (resume || (params.has("room") && params.has("secret"))) {
-  try { start("viewer"); } catch { el("error").textContent = "Saved pairing could not connect. Check the details and retry."; }
+if (saved) {
+  server.value = saved.server;
+  try { start({ role: "viewer", room: saved.room, token: saved.token }); } catch { el("error").textContent = "The previous session could not resume. Enter the current code."; }
+} else if (CODE_RE.test(code.value)) {
+  try { start({ role: "viewer", code: code.value }); } catch (e) { el("error").textContent = String(e); }
 }
