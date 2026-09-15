@@ -40,6 +40,7 @@ template <size_t N = 4096> class Samples {
     size_t count_ = 0, total_ = 0;
 
   public:
+    size_t count() const { return count_; }
     void add(double v) {
         values_[total_++ % N] = v;
         count_ = std::min(count_ + 1, N);

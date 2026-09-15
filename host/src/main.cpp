@@ -1,14 +1,18 @@
 #include "platform.hpp"
 #include "pattern.hpp"
 #include "transport.hpp"
+#include "settings.hpp"
 #include <atomic>
 #include <bcrypt.h>
 #include <d3d10.h>
+#include <d3d11_1.h>
 #include <fstream>
 #include <thread>
 #include <winrt/base.h>
+#include <shellapi.h>
 namespace bm {
 std::atomic<bool> running = true;
+NOTIFYICONDATAW tray{};
 BOOL WINAPI control(DWORD) {
     running = false;
     return TRUE;
@@ -30,12 +34,29 @@ std::string randomString(size_t length, bool room) {
     return s;
 }
 LRESULT CALLBACK pairingProc(HWND window, UINT message, WPARAM w, LPARAM l) {
+    if (message == WM_CLOSE) { ShowWindow(window, SW_HIDE); return 0; }
+    if (message == WM_APP + 1) {
+        if (l == WM_LBUTTONDBLCLK) { ShowWindow(window, SW_SHOW); SetForegroundWindow(window); }
+        if (l == WM_RBUTTONUP) {
+            auto menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, 1, L"Show pairing");
+            AppendMenuW(menu, MF_STRING, 2, L"Exit Browser Monitor");
+            POINT point; GetCursorPos(&point); SetForegroundWindow(window);
+            auto command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
+            DestroyMenu(menu);
+            if (command == 1) ShowWindow(window, SW_SHOW);
+            if (command == 2) DestroyWindow(window);
+        }
+        return 0;
+    }
     if (message == WM_DESTROY) {
+        Shell_NotifyIconW(NIM_DELETE, &tray);
+        running = false;
         return 0;
     }
     return DefWindowProcW(window, message, w, l);
 }
-void pairingWindow(const std::string &room, const std::string &secret) {
+void pairingWindow(const std::string &room, const std::string &secret, bool background) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = pairingProc;
     wc.hInstance = GetModuleHandleW(nullptr);
@@ -52,12 +73,20 @@ void pairingWindow(const std::string &room, const std::string &secret) {
     auto edit = CreateWindowExW(0, L"EDIT", wide.c_str(), WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY,
                                 16, 16, 670, 145, window, nullptr, wc.hInstance, nullptr);
     SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-    ShowWindow(window, SW_SHOW);
+    tray.cbSize = sizeof(tray); tray.hWnd = window; tray.uID = 1;
+    tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; tray.uCallbackMessage = WM_APP + 1;
+    tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(tray.szTip, L"Browser Monitor — right-click for pairing or exit");
+    Shell_NotifyIconW(NIM_ADD, &tray);
+    ShowWindow(window, background ? SW_HIDE : SW_SHOW);
 }
 struct Options {
-    std::string display, backend = "dxgi", mode = "stream", server, csv;
+    std::string display, identity, backend = "dxgi", mode = "stream", server, csv;
     unsigned fps = 60, seconds = 0, width = 1920, height = 1080;
-    bool list = false, allowPrimary = false, pairingStdin = false, pattern = false;
+    bool list = false, allowPrimary = false, pairingStdin = false, pattern = false, synthetic = false;
+    bool remember = false, background = false, newPairing = false;
+    bool flushGpu = false;
+    TransportTestOptions test;
 };
 class PollTimer {
     HANDLE timer_ =
@@ -71,11 +100,28 @@ class PollTimer {
     ~PollTimer() {
         CloseHandle(timer_);
     }
-    void wait() {
+    void wait(unsigned ms = 1) {
         LARGE_INTEGER due;
-        due.QuadPart = -10000;
+        due.QuadPart = -10000LL * ms;
         SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE);
         WaitForSingleObject(timer_, 100);
+    }
+};
+class CpuMeter {
+    uint64_t previous_ = 0;
+    Clock::time_point time_ = Clock::now();
+  public:
+    nlohmann::json sample() {
+        FILETIME creation{}, exit{}, kernel{}, user{};
+        if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) return nullptr;
+        auto ticks = [](FILETIME t) { return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+        const auto total = ticks(kernel) + ticks(user);
+        const auto now = Clock::now();
+        const auto seconds = std::chrono::duration<double>(now-time_).count();
+        nlohmann::json result = nullptr;
+        if (previous_ && seconds > 0) result = (total-previous_) / 1e7 / seconds / GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) * 100;
+        previous_ = total; time_ = now;
+        return result;
     }
 };
 Options parse(int argc, char **argv) {
@@ -93,6 +139,15 @@ Options parse(int argc, char **argv) {
             o.pairingStdin = true;
         else if (a == "--pattern")
             o.pattern = true;
+        else if (a == "--synthetic")
+            o.synthetic = true;
+        else if (a == "--remember") o.remember = true;
+        else if (a == "--background") o.background = true;
+        else if (a == "--new-pairing") o.newPairing = true;
+        else if (a == "--test-drop-every") o.test.dropEvery = std::stoul(value());
+        else if (a == "--test-drop-first-keyframe") o.test.dropFirstKeyframe = true;
+        else if (a == "--test-block-ice") o.test.blockIce = true;
+        else if (a == "--flush-gpu") o.flushGpu = true;
         else if (a == "--display")
             o.display = value();
         else if (a == "--capture")
@@ -122,7 +177,13 @@ Options parse(int argc, char **argv) {
     return o;
 }
 int run(int argc, char **argv) {
-    const auto o = parse(argc, argv);
+    auto o = parse(argc, argv);
+    nlohmann::json saved = nlohmann::json::object();
+    if (o.mode == "stream" && !o.pairingStdin && !o.list) {
+        saved = loadSettings();
+        if (o.display.empty()) { o.display = saved.value("display", ""); o.identity = saved.value("identity", ""); }
+        if (o.server.empty()) o.server = saved.value("server", "");
+    }
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     check(MFStartup(MF_VERSION), "Media Foundation startup");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -142,22 +203,35 @@ int run(int argc, char **argv) {
     std::unique_ptr<ITransport> transport;
     if (o.mode == "stream") {
         auto room = randomString(8, true), secret = randomString(32, false);
+        if (!o.newPairing && saved.contains("room") && saved.contains("secret")) {
+            room = saved.at("room").get<std::string>(); secret = saved.at("secret").get<std::string>();
+        }
         if (o.pairingStdin) {
             std::string line;
-            std::getline(std::cin, line);
-            if (line.size() > 256)
-                throw std::runtime_error("Pairing input too long");
-            auto pairing = nlohmann::json::parse(line);
+            char ch;
+            while (std::cin.get(ch) && ch != '\n' && line.size() <= 256) line += ch;
+            auto pairing = nlohmann::json::parse(line, nullptr, false);
+            if (line.size() > 256 || !pairing.is_object() || !pairing.contains("room") || !pairing["room"].is_string() || !pairing.contains("secret") || !pairing["secret"].is_string())
+                throw std::runtime_error("Invalid pairing input");
             room = pairing.at("room");
             secret = pairing.at("secret");
+        }
             if (room.size() != 8 ||
                 room.find_first_not_of("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") != std::string::npos ||
                 secret.size() != 64 || secret.find_first_not_of("0123456789abcdef") != std::string::npos)
                 throw std::runtime_error("Invalid pairing input");
-        } else
-            pairingWindow(room, secret);
+        if (o.remember) {
+            auto selected = std::find_if(outputs.begin(), outputs.end(), [&](const auto &d) { return d.name == o.display; });
+            if (selected == outputs.end() || selected->primary || o.synthetic)
+                throw std::runtime_error("--remember requires a connected secondary display; generated sources and primary displays cannot be saved.");
+            o.identity = displayIdentity(*selected);
+            if (o.identity.empty()) throw std::runtime_error("Cannot obtain a stable display identity; settings were not saved");
+            saveSettings({{"display",o.display},{"identity",o.identity},{"server",o.server},{"room",room},{"secret",secret}});
+        }
+        if (!o.pairingStdin) pairingWindow(room, secret, o.background);
+        if (o.background) ShowWindow(GetConsoleWindow(), SW_HIDE);
         std::cout << "Pairing room: " << room << " (secret excluded from logs)\n";
-        transport = webRtc(o.server, room, secret);
+        transport = webRtc(o.server, room, secret, o.test);
     }
     std::ofstream csv;
     if (!o.csv.empty()) {
@@ -169,45 +243,54 @@ int run(int argc, char **argv) {
                "queue_depth\n";
     }
     auto start = Clock::now();
-    unsigned recoveries = 0;
     const int64_t epoch = now100ns();
     PollTimer pollTimer;
+    CpuMeter cpu;
+    cpu.sample();
+    uint32_t configuredBitrate = 8000000;
+    auto lastEncoderChange = Clock::now();
     while (running && (!o.seconds || Clock::now() - start < std::chrono::seconds(o.seconds))) {
         try {
             auto all = displays();
-            auto it = std::find_if(all.begin(), all.end(), [&](auto &d) { return d.name == o.display; });
+            auto it = std::find_if(all.begin(), all.end(), [&](auto &d) { return o.identity.empty() ? d.name == o.display : displayIdentity(d) == o.identity; });
             if (it == all.end())
-                throw std::runtime_error("Selected display disconnected; waiting for the same display name");
+                throw std::runtime_error("Selected display disconnected; waiting for the same display identity");
             const auto selected = *it;
-            if (selected.primary && !o.allowPrimary)
+            if (selected.primary && !o.allowPrimary && !o.synthetic && o.mode != "encode")
                 throw std::runtime_error("Selected display is primary. Capture refused; --allow-primary is "
                                          "required to explicitly authorize it.");
             unsigned iw = selected.rect.right - selected.rect.left,
                      ih = selected.rect.bottom - selected.rect.top;
+            if (o.synthetic || o.mode == "encode") { iw = 1920; ih = 1080; }
             double scale = std::min({1.0, 1920.0 / iw, 1080.0 / ih});
             unsigned ow = unsigned(iw * scale) & ~1u, oh = unsigned(ih * scale) & ~1u;
             Device device(selected);
             std::unique_ptr<Pattern> pattern;
             if(o.pattern)pattern=std::make_unique<Pattern>(device,selected);
-            auto capture = o.backend == "wgc" ? wgc(device, selected) : duplication(device, selected);
+            std::unique_ptr<ICapture> capture;
+            if (!o.synthetic && o.mode != "encode")
+                capture = o.backend == "wgc" ? wgc(device, selected) : duplication(device, selected);
             std::unique_ptr<Converter> converter;
             std::unique_ptr<IEncoder> encoder;
             if (o.mode != "capture")
                 converter = std::make_unique<Converter>(device, iw, ih, ow, oh);
             if (o.mode == "encode" || o.mode == "capture-encode" || o.mode == "stream")
-                encoder = hardwareEncoder(device, selected, ow, oh, o.fps);
+                encoder = hardwareEncoder(device, selected, ow, oh, o.fps, configuredBitrate);
             std::cout << "Pipeline: " << o.backend << " -> GPU NV12 -> "
                       << (encoder ? encoder->name() : "benchmark") << " | GPU " << selected.gpu << " | " << ow
                       << 'x' << oh << '@' << o.fps << " | CPU readback: no\n";
             uint64_t captured = 0, encoded = 0, dropped = 0, noChange = 0, previousCaptured = 0,
                      previousEncoded = 0;
-            Samples<> capTimes, conversionTimes, encodeTimes, sizes;
-            uint32_t bitrate = 8000000, attemptedBitrate = 8000000;
-            auto report = Clock::now(), next = Clock::now(), lastOutput = Clock::now(),
+            Samples<> capTimes, conversionTimes, encodeTimes, pipelineTimes, sizes;
+            uint32_t bitrate = configuredBitrate, attemptedBitrate = configuredBitrate;
+            bool dynamicBitrate = true;
+            auto report = Clock::now(), next = Clock::now(),
                  lastInput = Clock::now();
             ComPtr<ID3D11Texture2D> synthetic;
+            ComPtr<ID3D11RenderTargetView> syntheticView;
+            ComPtr<ID3D11DeviceContext1> context1;
             bool keyframePending = true, haveSurface = false, repeatRequested = false;
-            if (o.mode == "encode") {
+            if (o.mode == "encode" || o.synthetic) {
                 D3D11_TEXTURE2D_DESC d{};
                 d.Width = iw;
                 d.Height = ih;
@@ -215,12 +298,12 @@ int run(int argc, char **argv) {
                 d.MipLevels = d.ArraySize = d.SampleDesc.Count = 1;
                 d.BindFlags = D3D11_BIND_RENDER_TARGET;
                 check(device.device->CreateTexture2D(&d, nullptr, &synthetic), "Benchmark BGRA source");
-                ComPtr<ID3D11RenderTargetView> view;
-                check(device.device->CreateRenderTargetView(synthetic.Get(), nullptr, &view),
+                check(device.device->CreateRenderTargetView(synthetic.Get(), nullptr, &syntheticView),
                       "Benchmark render target");
                 float color[4]{.08f, .3f, .18f, 1};
-                device.context->ClearRenderTargetView(view.Get(), color);
-                converter->convert(synthetic.Get(), 0);
+                device.context->ClearRenderTargetView(syntheticView.Get(), color);
+                check(device.context.As(&context1), "D3D11.1 generated test source");
+                if (o.mode == "encode") { converter->convert(synthetic.Get(), 0); device.context->Flush(); }
             }
             while (running && (!o.seconds || Clock::now() - start < std::chrono::seconds(o.seconds))) {
                 MSG msg;
@@ -234,11 +317,21 @@ int run(int argc, char **argv) {
                         keyframePending = true;
                         repeatRequested = true;
                     }
-                    if (encoder && transport->targetBitrate() != attemptedBitrate) {
+                    if (encoder && dynamicBitrate && transport->targetBitrate() != attemptedBitrate) {
                         auto target = transport->targetBitrate();
                         attemptedBitrate = target;
                         if (encoder->bitrate(target))
                             bitrate = target;
+                        else dynamicBitrate = false;
+                    }
+                    if (encoder && !dynamicBitrate && Clock::now()-lastEncoderChange > std::chrono::seconds(5)) {
+                        const auto target = transport->targetBitrate();
+                        if (target <= bitrate * 3 / 4 || target >= bitrate + 2000000) {
+                            configuredBitrate = target;
+                            lastEncoderChange = Clock::now();
+                            std::cout << "Recreating hardware encoder at " << target << " bps (live bitrate update unsupported)\n";
+                            break;
+                        }
                     }
                 }
                 if (encoder) {
@@ -248,13 +341,13 @@ int run(int argc, char **argv) {
                     }
                     for (auto &f : encoder->poll()) {
                         ++encoded;
-                        lastOutput = Clock::now();
                         encodeTimes.add(f.latencyMs);
+                        pipelineTimes.add((now100ns()-epoch-f.timestamp)/10000.0);
                         sizes.add(double(f.bytes.size()));
                         if (transport)
                             transport->send(f);
                     }
-                    if (encoder->pending() && Clock::now() - lastOutput > std::chrono::seconds(3))
+                    if (encoder->pending() && Clock::now() - lastInput > std::chrono::seconds(3))
                         throw std::runtime_error("Encoder stalled; recreating GPU pipeline");
                 }
                 auto now = Clock::now();
@@ -265,6 +358,8 @@ int run(int argc, char **argv) {
                         next = now + std::chrono::nanoseconds(1000000000 / o.fps);
                     bool active = !transport || transport->connected();
                     if (active) {
+                        // Do not consume the first unchanged desktop frame before the encoder can accept it.
+                        if (encoder && !encoder->ready()) { pollTimer.wait(); continue; }
                         auto begin = Clock::now();
                         std::optional<Frame> frame;
                         if (synthetic)
@@ -285,9 +380,17 @@ int run(int argc, char **argv) {
                                     ++dropped;
                                 else {
                                     auto t = Clock::now();
-                                    auto nv12 = synthetic ? converter->texture(0)
+                                    if (o.synthetic) {
+                                        float background[4]{.04f,.08f,.12f,1}, foreground[4]{.3f,.85f,.6f,1};
+                                        device.context->ClearRenderTargetView(syntheticView.Get(), background);
+                                        LONG x = LONG((captured * 12) % (iw - 100));
+                                        D3D11_RECT rect{x,0,x+100,LONG(ih)};
+                                        context1->ClearView(syntheticView.Get(), foreground, &rect, 1);
+                                    }
+                                    auto nv12 = o.mode == "encode" ? converter->texture(0)
                                                           : converter->convert(frame->texture.Get(), 0);
-                                    if (!synthetic)
+                                    if (o.flushGpu) device.context->Flush();
+                                    if (o.mode != "encode")
                                         conversionTimes.add(
                                             std::chrono::duration<double, std::milli>(Clock::now() - t)
                                                 .count());
@@ -312,7 +415,7 @@ int run(int argc, char **argv) {
                                 }
                             }
                         }
-                        capture->release();
+                        if (capture) capture->release();
                     }
                 }
                 if (now - report >= std::chrono::seconds(1)) {
@@ -334,6 +437,27 @@ int run(int argc, char **argv) {
                                             {"queue_depth", encoder ? encoder->pending() : 0}};
                     if (transport)
                         stats["webrtc"] = transport->stats();
+                    stats["type"] = "host-stats";
+                    stats["capture_fps"] = (captured - previousCaptured) / std::chrono::duration<double>(now-report).count();
+                    stats["encode_fps"] = (encoded - previousEncoded) / std::chrono::duration<double>(now-report).count();
+                    stats["capture_backend"] = o.synthetic || o.mode == "encode" ? "Generated GPU source" : o.backend;
+                    stats["encoder"] = encoder ? encoder->name() : "none";
+                    stats["gpu"] = selected.gpu;
+                    stats["video_path"] = "GPU";
+                    stats["hardware_encoder"] = bool(encoder);
+                    stats["cpu_percent"] = cpu.sample();
+                    stats["dynamic_bitrate"] = dynamicBitrate;
+                    stats["target_bitrate"] = transport ? transport->targetBitrate() : bitrate;
+                    stats["flush_gpu"] = o.flushGpu;
+                    stats["pipeline_ms_mean"] = pipelineTimes.count() ? nlohmann::json(pipelineTimes.mean()) : nlohmann::json(nullptr);
+                    stats["pipeline_ms_p95"] = pipelineTimes.count() ? nlohmann::json(pipelineTimes.percentile(.95)) : nlohmann::json(nullptr);
+                    if (!encodeTimes.count()) { stats["encode_ms_mean"] = nullptr; stats["encode_ms_p95"] = nullptr; stats["encode_ms_p99"] = nullptr; }
+                    if (converter && converter->gpuTimes().count()) {
+                        // This asynchronous GPU command span includes driver submission delay.
+                        // It is not a pure video-processor execution duration.
+                        stats["gpu_command_span_ms_mean"] = converter->gpuTimes().mean();
+                    }
+                    if (transport) transport->diagnostics(stats);
                     std::cout << stats.dump() << '\n';
                     std::cout << "Interval FPS capture="
                               << (captured - previousCaptured) /
@@ -358,7 +482,7 @@ int run(int argc, char **argv) {
                     report = now;
                     auto current = displays();
                     auto found = std::find_if(current.begin(), current.end(),
-                                              [&](auto &d) { return d.name == o.display; });
+                                              [&](auto &d) { return d.name == selected.name; });
                     if (found == current.end() || found->monitor != selected.monitor ||
                         found->primary != selected.primary ||
                         memcmp(&found->rect, &selected.rect, sizeof(RECT)) ||
@@ -366,14 +490,16 @@ int run(int argc, char **argv) {
                         throw std::runtime_error("Display topology changed; revalidate selection");
                 }
                 // Poll async output promptly; do not wait a full frame period to transmit it.
-                pollTimer.wait();
+                pollTimer.wait(transport && !transport->connected() ? 20 : 1);
             }
         } catch (const std::exception &e) {
             std::cerr << e.what() << '\n';
-            if (o.mode != "stream" || ++recoveries > 20)
+            if (o.mode != "stream")
                 throw;
             std::cerr << "Retrying the explicitly selected display in 1 second\n";
             for (int i = 0; i < 100 && running; ++i) {
+                MSG message;
+                while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
                 if (transport)
                     transport->poll();
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -381,6 +507,7 @@ int run(int argc, char **argv) {
         }
     }
     transport.reset();
+    if (tray.hWnd) Shell_NotifyIconW(NIM_DELETE, &tray);
     MFShutdown();
     return 0;
 }

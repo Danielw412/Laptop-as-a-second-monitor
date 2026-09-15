@@ -118,5 +118,5 @@ class IEncoder {
     virtual size_t pending() const = 0;
 };
 std::unique_ptr<IEncoder> hardwareEncoder(Device &, const Display &, unsigned width, unsigned height,
-                                          unsigned fps);
+                                          unsigned fps, uint32_t bitrate = 8000000);
 } // namespace bm

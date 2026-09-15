@@ -167,6 +167,15 @@ video {
   outline: 2px solid #adebc5;
   outline-offset: 3px;
 }
+#dashboard { position: relative; }
+#dashboard[open] { position: fixed; bottom: 12px; right: 16px; z-index: 5; width: min(880px, calc(100vw - 32px)); max-height: 70dvh; overflow: auto; padding: 16px; background: #171d24f5; border: 1px solid #414d5b; border-radius: 8px; box-shadow: 0 8px 40px #0008; }
+#dashboard-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px 24px; }
+#dashboard h2 { color: #adebc5; font-size: 13px; margin: 18px 0 10px; }
+#dashboard dl { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 6px 14px; margin: 0; font-size: 12px; }
+#dashboard dt { color: #aab5c2; }
+#dashboard dd { margin: 0; color: #e9eef5; text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.metrics-note { font-size: 11px; margin-bottom: 0; }
+@media (max-width: 600px) { #dashboard-grid { grid-template-columns: 1fr; } }
 @media (max-width: 600px) {
   header {
     gap: 10px;

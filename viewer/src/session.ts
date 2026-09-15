@@ -17,6 +17,19 @@ export class Session {
   private deadline?: ReturnType<typeof setTimeout>;
   private statsTimer?: ReturnType<typeof setInterval>;
   private chain = Promise.resolve();
+  private started = performance.now();
+  private stages: Record<string, unknown> = {};
+  private iceStarted?: number;
+  private connectionStats(resetPeer = false) {
+    this.diagnostics({ type: "connection-stats", ...this.stages,
+      state: this.pc?.connectionState ?? "new", ice: this.pc?.iceConnectionState,
+      resetPeer });
+  }
+  private mark(name: string) {
+    if (this.stages[name] === undefined) this.stages[name] = performance.now() - this.started;
+    this.connectionStats();
+  }
+  presented() { this.mark("firstVideoMs"); }
   constructor(
     private server: string,
     private room: string,
@@ -30,6 +43,9 @@ export class Session {
   ) {}
   start() {
     if (this.stopped) return;
+    this.started = performance.now();
+    this.stages = { label: "Connecting" };
+    this.connectionStats(true);
     const url = new URL(this.server);
     if (
       url.protocol !== "https:" &&
@@ -97,12 +113,14 @@ export class Session {
     old?.close();
     this.channel = undefined;
     this.pending = [];
+    this.connectionStats(true);
   }
   private data(channel: RTCDataChannel) {
     this.channel = channel;
     channel.onmessage = (e) => {
       try {
-        this.diagnostics(JSON.parse(e.data));
+        if (typeof e.data === "string" && e.data.length < 8192)
+          this.diagnostics(JSON.parse(e.data));
       } catch {
         /* Ignore non-JSON diagnostics. */
       }
@@ -110,11 +128,17 @@ export class Session {
   }
   private async message(m: ServerMessage) {
     if (m.type === "error") {
+      if (["host-unavailable", "role-occupied", "expired"].includes(m.code)) {
+        this.status(m.code === "host-unavailable" ? "Waiting for host…" : "Rejoining room…");
+        this.ws?.close();
+        return;
+      }
       this.error(`Pairing failed: ${m.code}`);
       this.stop();
       return;
     }
     if (m.type === "authenticated") {
+      this.mark("signalingMs");
       this.retry = 0;
       this.error("");
       this.status("Paired. Waiting for the other laptop…");
@@ -127,12 +151,26 @@ export class Session {
     }
     if (m.type === "ready") {
       this.resetPeer();
+      for (const key of ["peerAvailableMs", "sdpMs", "iceMs", "webrtcMs", "firstVideoMs", "iceDurationMs"])
+        delete this.stages[key];
+      this.iceStarted = undefined;
+      this.mark("peerAvailableMs");
       this.generation = m.generation;
       const pc = (this.pc = new RTCPeerConnection({
         iceServers: ice.iceServers,
       }));
       const generation = m.generation;
       this.status("Establishing direct connection…");
+      pc.oniceconnectionstatechange = () => {
+        if (this.pc !== pc) return;
+        if (pc.iceConnectionState === "checking" && this.iceStarted === undefined) this.iceStarted = performance.now();
+        if (["connected", "completed"].includes(pc.iceConnectionState)) {
+          if (this.stages.iceDurationMs === undefined && this.iceStarted !== undefined)
+            this.stages.iceDurationMs = performance.now() - this.iceStarted;
+          this.mark("iceMs");
+        }
+        this.connectionStats();
+      };
       pc.onicecandidate = (e) => {
         if (this.pc === pc && e.candidate)
           this.send({
@@ -143,6 +181,7 @@ export class Session {
           });
       };
       pc.ontrack = (e) => {
+        if (this.pc !== pc) return;
         const receiver = e.receiver as RTCRtpReceiver & {
           jitterBufferTarget?: number;
         };
@@ -153,22 +192,24 @@ export class Session {
       pc.onconnectionstatechange = () => {
         if (this.pc !== pc) return;
         this.status(`WebRTC ${pc.connectionState}`);
+        this.connectionStats();
         if (pc.connectionState === "connected") {
           clearTimeout(this.deadline);
           this.error("");
+          this.mark("webrtcMs");
         }
-        if (pc.connectionState === "failed") this.error(DIRECT_FAILURE);
+        if (pc.connectionState === "failed") this.reconnectDirect();
         if (pc.connectionState === "disconnected") {
           clearTimeout(this.deadline);
           this.deadline = setTimeout(
-            () => this.error(DIRECT_FAILURE),
+            () => this.reconnectDirect(),
             ice.connectionTimeoutMs,
           );
         }
       };
       this.deadline = setTimeout(() => {
         if (this.pc === pc && pc.connectionState !== "connected")
-          this.error(DIRECT_FAILURE);
+          this.reconnectDirect();
       }, ice.connectionTimeoutMs);
       const stats = new ReceiverStats();
       let sampling = false;
@@ -217,6 +258,7 @@ export class Session {
     if (m.generation !== this.generation || !this.pc) return;
     if (m.type === "offer" || m.type === "answer") {
       await this.pc.setRemoteDescription({ type: m.type, sdp: m.sdp });
+      this.mark("sdpMs");
       for (const c of this.pending) await this.pc.addIceCandidate(c);
       this.pending = [];
       if (m.type === "offer") {
@@ -228,5 +270,14 @@ export class Session {
       if (this.pc.remoteDescription) await this.pc.addIceCandidate(c);
       else if (this.pending.length < 128) this.pending.push(c);
     }
+  }
+  private reconnectDirect() {
+    this.error(DIRECT_FAILURE);
+    this.stages.label = "Failed";
+    this.diagnostics({type: "connection-stats", ...this.stages, state: "failed", ice: this.pc?.iceConnectionState});
+    // Rejoining creates a fresh generation and triggers a new host offer.
+    // Leave the failure visible before retrying; never substitute a relay.
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => this.ws?.close(), 3000);
   }
 }

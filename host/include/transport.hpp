@@ -11,6 +11,8 @@ class ITransport {
     virtual bool consumeKeyframeRequest() = 0;
     virtual uint32_t targetBitrate() const = 0;
     virtual nlohmann::json stats() const = 0;
+    virtual void diagnostics(const nlohmann::json &) = 0;
 };
-std::unique_ptr<ITransport> webRtc(std::string server, std::string room, std::string secret);
+struct TransportTestOptions { unsigned dropEvery = 0; bool dropFirstKeyframe = false, blockIce = false; };
+std::unique_ptr<ITransport> webRtc(std::string server, std::string room, std::string secret, TransportTestOptions test = {});
 } // namespace bm

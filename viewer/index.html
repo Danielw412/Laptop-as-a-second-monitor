@@ -70,9 +70,10 @@
     </main>
     <footer>
       <span>Direct WebRTC · No media relay</span>
-      <details>
-        <summary>Diagnostics</summary>
-        <pre id="stats">No connection</pre>
+      <details id="dashboard">
+        <summary>Connection & performance</summary>
+        <div id="dashboard-grid"></div>
+        <p class="metrics-note">— = unavailable. Stages are elapsed from this signaling attempt. Host metrics expire after 3.5 seconds. Pairing stays in this tab until you disconnect or close it.</p>
       </details>
     </footer>
     <script type="module" src="/src/main.ts"></script>

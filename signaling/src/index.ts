@@ -147,6 +147,14 @@ export class Room extends DurableObject<Env> {
     }
     const session = await this.ctx.storage.get<Session>("session");
     if (session && session.expires <= Date.now()) {
+      // Keep a daily-use room alive while its authenticated host remains connected.
+      // This alarm runs twice a day; no polling loop prevents hibernation.
+      if (this.peers("host").length) {
+        session.expires = Date.now() + TTL;
+        await this.ctx.storage.put("session", session);
+        await this.ctx.storage.setAlarm(session.expires);
+        return;
+      }
       for (const ws of this.ctx.getWebSockets()) ws.close(1008, "expired");
       await this.ctx.storage.deleteAll();
       return;

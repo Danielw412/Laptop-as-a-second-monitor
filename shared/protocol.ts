@@ -59,11 +59,11 @@ export function parseClient(raw: string): ClientMessage {
 }
 export interface Telemetry {
   type: "telemetry";
-  loss: number;
-  rttMs: number;
-  jitterMs: number;
-  bitrate: number;
-  fps: number;
-  dropped: number;
-  decoded: number;
+  loss: number | null;
+  rttMs: number | null;
+  jitterMs: number | null;
+  bitrate: number | null;
+  fps: number | null;
+  dropped: number | null;
+  decoded: number | null;
 }

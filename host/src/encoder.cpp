@@ -55,6 +55,9 @@ class MfEncoder final : public IEncoder {
     std::map<int64_t, int64_t> pending_;
     bool idr_ = true;
     std::vector<uint8_t> headers_;
+    ComPtr<IMFSample> outputSample_;
+    ComPtr<IMFMediaBuffer> outputBuffer_;
+    DWORD outputCapacity_ = 0, outputAlignment_ = 0;
     bool setting(const GUID &key, ULONG value, bool boolean, const char *label) {
         if (!codec_ || codec_->IsSupported(&key) != S_OK || codec_->IsModifiable(&key) != S_OK) {
             std::cout << "Encoder option unsupported: " << label << '\n';
@@ -107,7 +110,7 @@ class MfEncoder final : public IEncoder {
     }
 
   public:
-    MfEncoder(Device &device, IMFActivate *activation, unsigned width, unsigned height, unsigned fps)
+    MfEncoder(Device &device, IMFActivate *activation, unsigned width, unsigned height, unsigned fps, uint32_t bitrate)
         : activation_(activation), fps_(fps) {
         wchar_t *friendly = nullptr;
         UINT32 length;
@@ -147,7 +150,7 @@ class MfEncoder final : public IEncoder {
         check(MFCreateMediaType(&out), "Output type");
         check(out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "Video type");
         check(out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264), "H264 type");
-        check(out->SetUINT32(MF_MT_AVG_BITRATE, 8000000), "Initial bitrate");
+        check(out->SetUINT32(MF_MT_AVG_BITRATE, bitrate), "Initial bitrate");
         check(out->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive), "Progressive");
         check(out->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base), "Baseline profile");
         check(out->SetUINT32(MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4_2), "H264 level 4.2");
@@ -233,12 +236,17 @@ class MfEncoder final : public IEncoder {
             MFT_OUTPUT_DATA_BUFFER out{};
             out.dwStreamID = output_;
             if (!(info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-                check(MFCreateSample(&allocated), "Output sample");
-                ComPtr<IMFMediaBuffer> b;
-                check(MFCreateAlignedMemoryBuffer(std::max<DWORD>(info.cbSize, 1920u * 1080u * 2u),
-                                                  info.cbAlignment ? info.cbAlignment - 1 : 0, &b),
-                      "Compressed output buffer");
-                check(allocated->AddBuffer(b.Get()), "Output sample buffer");
+                const auto capacity = std::max<DWORD>(info.cbSize, 1920u * 1080u * 2u);
+                if (!outputSample_ || outputCapacity_ < capacity || outputAlignment_ != info.cbAlignment) {
+                    outputSample_.Reset(); outputBuffer_.Reset();
+                    check(MFCreateSample(&outputSample_), "Output sample");
+                    check(MFCreateAlignedMemoryBuffer(capacity, info.cbAlignment ? info.cbAlignment - 1 : 0, &outputBuffer_), "Compressed output buffer");
+                    check(outputSample_->AddBuffer(outputBuffer_.Get()), "Output sample buffer");
+                    outputCapacity_ = capacity; outputAlignment_ = info.cbAlignment;
+                }
+                check(outputSample_->DeleteAllItems(), "Reset output attributes");
+                check(outputBuffer_->SetCurrentLength(0), "Reset output buffer length");
+                allocated = outputSample_;
                 out.pSample = allocated.Get();
             }
             DWORD status;
@@ -299,7 +307,7 @@ class MfEncoder final : public IEncoder {
     }
 };
 std::unique_ptr<IEncoder> hardwareEncoder(Device &device, const Display &display, unsigned width,
-                                          unsigned height, unsigned fps) {
+                                          unsigned height, unsigned fps, uint32_t bitrate) {
     ComPtr<IMFAttributes> attrs;
     check(MFCreateAttributes(&attrs, 1), "Encoder filter");
     UINT64 luid =
@@ -321,7 +329,7 @@ std::unique_ptr<IEncoder> hardwareEncoder(Device &device, const Display &display
     CoTaskMemFree(acts);
     for (auto &a : candidates) {
         try {
-            return std::make_unique<MfEncoder>(device, a.Get(), width, height, fps);
+            return std::make_unique<MfEncoder>(device, a.Get(), width, height, fps, bitrate);
         } catch (const std::exception &e) {
             std::cerr << "Hardware encoder rejected: " << e.what() << '\n';
             a->ShutdownObject();

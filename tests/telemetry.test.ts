@@ -1,5 +1,11 @@
 import { it, expect } from "vitest";
 import { intervalStats } from "../viewer/src/telemetry";
+it("preserves missing counters as unavailable rather than zero", () => {
+  expect(intervalStats({time:2000}, {time:1000})).toEqual({loss:null,bitrate:null,fps:null,dropped:null});
+});
+it("does not invent a delta when a counter first appears", () => {
+  expect(intervalStats({time:2000,decoded:60}, {time:1000})?.fps).toBeNull();
+});
 it("uses interval loss rather than cumulative session loss", () => {
   const a = {
     time: 1000,
