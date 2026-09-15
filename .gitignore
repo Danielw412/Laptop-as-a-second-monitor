@@ -2,6 +2,7 @@ node_modules/
 dist/
 build/
 .deps/
+driver/**/x64/
 .wrangler/
 .env
 .env.*
