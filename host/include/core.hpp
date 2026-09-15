@@ -8,11 +8,14 @@
 #include <vector>
 namespace bm {
 class BitrateController {
-    uint32_t bitrate_ = 8000000;
+    uint32_t bitrate_ = 8000000, minimum_ = 1500000, maximum_ = 16000000;
     int good_ = 0;
     double loss_ = 0, rtt_ = 0;
 
   public:
+    BitrateController() = default;
+    BitrateController(uint32_t initial, uint32_t minimum, uint32_t maximum)
+        : bitrate_(std::clamp(initial, minimum, maximum)), minimum_(minimum), maximum_(maximum) {}
     uint32_t bitrate() const {
         return bitrate_;
     }
@@ -23,11 +26,11 @@ class BitrateController {
         loss_ = 0.7 * loss_ + 0.3 * loss;
         rtt_ = 0.7 * rtt_ + 0.3 * rtt;
         if (loss > 0.05 || loss_ > 0.025 || rtt > 250 || jitter > 40) {
-            bitrate_ = std::max(1500000u, bitrate_ * 75 / 100);
+            bitrate_ = std::max(minimum_, bitrate_ * 75 / 100);
             good_ = 0;
         } else if (loss_ < 0.005 && rtt_ < 120 && jitter < 15) {
             if (++good_ >= 8) {
-                bitrate_ = std::min(16000000u, bitrate_ + 250000);
+                bitrate_ = std::min(maximum_, bitrate_ + 250000);
                 good_ = 0;
             }
         } else

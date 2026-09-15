@@ -1,0 +1,32 @@
+#include <windows.h>
+#include "resource.h"
+IDI_APP ICON "BrowserMonitor.ico"
+IDI_APP_READY ICON "BrowserMonitor-ready.ico"
+IDI_APP_CONNECTED ICON "BrowserMonitor-connected.ico"
+IDI_APP_WARNING ICON "BrowserMonitor-warning.ico"
+IDI_APP_ERROR ICON "BrowserMonitor-error.ico"
+IDI_APP_OFF ICON "BrowserMonitor-off.ico"
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,2,0,0
+ PRODUCTVERSION 0,2,0,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "Browser Monitor"
+      VALUE "FileDescription", "Browser Monitor"
+      VALUE "FileVersion", "0.2.0"
+      VALUE "InternalName", "BrowserMonitor"
+      VALUE "OriginalFilename", "BrowserMonitor.exe"
+      VALUE "ProductName", "Browser Monitor"
+      VALUE "ProductVersion", "0.2.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

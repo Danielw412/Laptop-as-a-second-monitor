@@ -33,6 +33,7 @@ jobs:
         with:
           name: browser-monitor-windows-x64
           path: |
-            build/host/browser-monitor.exe
+            build/host/BrowserMonitor.exe
+            build/host/BrowserMonitorDisplay.exe
+            build/host/browser-monitor-bench.exe
             README.md
-            docs/

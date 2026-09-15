@@ -17,45 +17,46 @@
       <section id="pairing">
         <h1>Your second screen.<br />In a browser.</h1>
         <p>
-          Start Browser Monitor on your Windows PC, then enter its pairing
-          details here.
+          Start Browser Monitor on your Windows PC and enter the six-character
+          code it shows. The code changes every two minutes; the connection
+          stays up.
         </p>
         <form id="join">
-          <label
-            >Signaling server<input
-              id="server"
-              type="url"
+          <label class="code-label"
+            >Pairing code<input
+              id="code"
               required
-              placeholder="https://browser-monitor-signaling.…workers.dev"
-              autocomplete="url"
+              maxlength="6"
+              pattern="[A-HJ-NP-Z2-9]{6}"
+              placeholder="K7M4Q2"
+              autocomplete="one-time-code"
+              inputmode="text"
+              autocapitalize="characters"
+              spellcheck="false"
+              autofocus
           /></label>
-          <div class="row">
-            <label
-              >Room code<input
-                id="room"
-                required
-                maxlength="8"
-                pattern="[A-HJ-NP-Z2-9]{8}"
-                placeholder="ABCDEFGH"
-                autocomplete="off" /></label
-            ><label
-              >Session secret<input
-                id="secret"
-                required
-                type="password"
-                minlength="64"
-                maxlength="64"
-                autocomplete="off"
-                placeholder="Paste the session secret"
-            /></label>
-          </div>
           <button type="submit">Connect display</button>
+          <details id="advanced">
+            <summary>Advanced</summary>
+            <label
+              >Signaling server<input
+                id="server"
+                type="url"
+                required
+                placeholder="https://browser-monitor-signaling.…workers.dev"
+                autocomplete="url"
+            /></label>
+            <p class="metrics-note">
+              Signaling only coordinates the connection. Video travels directly
+              between the two computers over WebRTC.
+            </p>
+          </details>
         </form>
         <details id="test-tools">
           <summary>Browser sender test</summary>
           <p>
             Use this on the sending PC to test pairing and WebRTC before running
-            the native host.
+            the native host. It publishes a one-off code for two minutes.
           </p>
           <button id="test-host">Share a screen</button
           ><button id="test-pattern">Stream test pattern</button
@@ -73,7 +74,7 @@
       <details id="dashboard">
         <summary>Connection & performance</summary>
         <div id="dashboard-grid"></div>
-        <p class="metrics-note">— = unavailable. Stages are elapsed from this signaling attempt. Host metrics expire after 3.5 seconds. Pairing stays in this tab until you disconnect or close it.</p>
+        <p class="metrics-note">— = unavailable. Stages are elapsed from this signaling attempt. Host metrics expire after 3.5 seconds. The session stays in this tab until you disconnect or close it.</p>
       </details>
     </footer>
     <script type="module" src="/src/main.ts"></script>

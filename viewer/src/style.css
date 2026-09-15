@@ -94,16 +94,26 @@ input {
   color: #fff;
   margin-bottom: 20px;
 }
-.row {
-  display: flex;
-  gap: 16px;
+.code-label {
+  max-width: 320px;
 }
-.row label:first-child {
-  flex: 0 0 180px;
+#code {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 32px;
+  letter-spacing: 8px;
+  text-transform: uppercase;
+  text-align: center;
+  padding: 14px 8px 14px 16px;
 }
-#room {
-  font-family: monospace;
-  letter-spacing: 2px;
+#code::placeholder {
+  color: #4d5866;
+  letter-spacing: 8px;
+}
+#advanced {
+  margin-top: 28px;
+}
+#advanced label {
+  margin-top: 14px;
 }
 details {
   font-size: 14px;
