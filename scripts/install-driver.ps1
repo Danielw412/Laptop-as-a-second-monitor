@@ -11,10 +11,15 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
 }
 $subject = 'CN=Browser Monitor IDD Local Test Signing'
 if ($Uninstall) {
+  # Exiting the app removes the monitor; then drop the leftover software device node and the package.
+  Get-Process BrowserMonitorIddApp -ErrorAction SilentlyContinue | Stop-Process -Force
+  Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'BrowserMonitorIdd' } |
+    ForEach-Object { Invoke-Checked pnputil @('/remove-device', $_.InstanceId) }
   Get-WindowsDriver -Online | Where-Object { (Split-Path $_.OriginalFileName -Leaf) -eq 'browsermonitoridd.inf' } |
-    ForEach-Object { Invoke-Checked pnputil @('/delete-driver', $_.Driver, '/uninstall', '/force') }
-  Get-ChildItem Cert:\LocalMachine\My, Cert:\LocalMachine\Root, Cert:\LocalMachine\TrustedPublisher |
-    Where-Object Subject -eq $subject | Remove-Item
+    ForEach-Object { Invoke-Checked pnputil @('/delete-driver', $_.Driver, '/uninstall') }
+  # -DeleteKey is a Cert: provider parameter, so it only binds when the path is given explicitly (not when piped).
+  Get-ChildItem Cert:\LocalMachine\My | Where-Object Subject -eq $subject | ForEach-Object { Remove-Item -Path $_.PSPath -DeleteKey }
+  Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\TrustedPublisher | Where-Object Subject -eq $subject | Remove-Item
   Write-Host 'Browser Monitor IDD driver package and signing certificate removed.'
   return
 }
@@ -22,10 +27,11 @@ $package = "$projectRoot/driver/x64/$Configuration/BrowserMonitorIdd"
 if (!(Test-Path "$package/BrowserMonitorIdd.cat")) { throw "Driver package not found. Run scripts/build-driver.ps1 -Configuration $Configuration first." }
 $signtool = Get-ChildItem "$projectRoot/.deps/packages/Microsoft.Windows.SDK.CPP.*/c/bin/*/x64/signtool.exe" | Select-Object -Last 1
 if (!$signtool) { throw 'signtool.exe not found. Run scripts/build-driver.ps1 first.' }
-# Non-exportable key kept in the machine store; trusted only on this machine.
+# Non-exportable key kept in the machine store; trusted only on this machine. Code-signing EKU only and CA=false, so
+# trusting it in Root cannot be used to issue other certificates.
 $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq $subject -and $_.NotAfter -gt (Get-Date).AddDays(1) } | Select-Object -First 1
 if (!$cert) {
-  $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject -CertStoreLocation Cert:\LocalMachine\My -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddYears(2)
+  $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject -CertStoreLocation Cert:\LocalMachine\My -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddYears(2) -TextExtension @('2.5.29.19={critical}{text}ca=false')
 }
 foreach ($storeName in 'Root', 'TrustedPublisher') {
   $store = [Security.Cryptography.X509Certificates.X509Store]::new($storeName, 'LocalMachine')
