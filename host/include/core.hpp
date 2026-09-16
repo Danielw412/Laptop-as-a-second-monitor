@@ -63,13 +63,15 @@ template <size_t N = 4096> class Samples {
         return copy[i];
     }
 };
-// Convert AVCC length-prefixed access units to Annex B; never reinterpret malformed lengths.
-inline std::vector<uint8_t> annexB(std::span<const uint8_t> bytes) {
+// Append AVCC length-prefixed access units as Annex B (already Annex B input is copied as is); never
+// reinterpret malformed lengths.
+inline void appendAnnexB(std::vector<uint8_t> &out, std::span<const uint8_t> bytes) {
     if (bytes.size() >= 4 && bytes[0] == 0 && bytes[1] == 0 &&
-        (bytes[2] == 1 || (bytes[2] == 0 && bytes[3] == 1)))
-        return {bytes.begin(), bytes.end()};
-    std::vector<uint8_t> out;
-    out.reserve(bytes.size());
+        (bytes[2] == 1 || (bytes[2] == 0 && bytes[3] == 1))) {
+        out.insert(out.end(), bytes.begin(), bytes.end());
+        return;
+    }
+    out.reserve(out.size() + bytes.size());
     size_t offset = 0;
     while (offset < bytes.size()) {
         if (bytes.size() - offset < 4)
@@ -83,6 +85,10 @@ inline std::vector<uint8_t> annexB(std::span<const uint8_t> bytes) {
         out.insert(out.end(), bytes.begin() + offset, bytes.begin() + offset + n);
         offset += n;
     }
+}
+inline std::vector<uint8_t> annexB(std::span<const uint8_t> bytes) {
+    std::vector<uint8_t> out;
+    appendAnnexB(out, bytes);
     return out;
 }
 inline uint32_t rtpTimestamp(int64_t sample100ns) {

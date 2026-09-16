@@ -15,12 +15,23 @@ namespace {
     s << what << " (0x" << std::hex << uint32_t(e.code()) << ")";
     throw std::runtime_error(s.str());
 }
+// Owns the auto-reset event the frame pool's thread signals. Shared with the FrameArrived handler so a callback
+// that runs after teardown can never touch a closed handle.
+struct FrameSignal {
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    ~FrameSignal() {
+        if (event)
+            CloseHandle(event);
+    }
+};
 } // namespace
 class Wgc final : public ICapture {
     Capture::GraphicsCaptureItem item_{nullptr};
     Capture::Direct3D11CaptureFramePool pool_{nullptr};
     Capture::GraphicsCaptureSession session_{nullptr};
     Capture::Direct3D11CaptureFrame held_{nullptr};
+    winrt::event_token arrived_{};
+    std::shared_ptr<FrameSignal> signal_ = std::make_shared<FrameSignal>();
     SizeInt32 size_{};
     void create(Device &device, const Display &display) {
         if (!Capture::GraphicsCaptureSession::IsSupported())
@@ -38,6 +49,9 @@ class Wgc final : public ICapture {
         auto d3d = inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
         pool_ = Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
             d3d, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size_);
+        // The pool's own thread wakes the engine the moment the compositor hands over a frame, so the engine
+        // never polls for frames on a timer and never sits on a finished frame until its next tick.
+        arrived_ = pool_.FrameArrived([signal = signal_](auto &&, auto &&) { SetEvent(signal->event); });
         session_ = pool_.CreateCaptureSession(item_);
         session_.IsCursorCaptureEnabled(true);
         session_.StartCapture();
@@ -45,6 +59,8 @@ class Wgc final : public ICapture {
 
   public:
     Wgc(Device &device, const Display &display) {
+        if (!signal_->event)
+            throw std::runtime_error("WGC frame event");
         try {
             create(device, display);
         } catch (const winrt::hresult_error &e) {
@@ -53,6 +69,11 @@ class Wgc final : public ICapture {
     }
     // Destructors must not throw; Close() can fail once the display or the capture item is already gone.
     ~Wgc() {
+        try {
+            if (pool_ && arrived_)
+                pool_.FrameArrived(arrived_);
+        } catch (...) {
+        }
         try {
             release();
         } catch (...) {
@@ -68,16 +89,26 @@ class Wgc final : public ICapture {
         } catch (...) {
         }
     }
-    std::optional<Frame> acquire() override {
+    HANDLE frameEvent() const override {
+        return signal_->event;
+    }
+    std::optional<Frame> acquire(unsigned timeoutMs) override {
         try {
+            auto next = pool_.TryGetNextFrame();
+            if (!next && timeoutMs) {
+                WaitForSingleObject(signal_->event, timeoutMs);
+                next = pool_.TryGetNextFrame();
+            }
+            if (!next)
+                return {}; // Nothing newer: a frame the caller still holds stays valid.
             release();
-            held_ = pool_.TryGetNextFrame();
-            if (!held_)
-                return {};
-            // Retain only the newest available frame.
+            held_ = next;
+            uint32_t skipped = 0;
+            // Retain only the newest available frame; anything older is stale by definition.
             while (auto newer = pool_.TryGetNextFrame()) {
                 held_.Close();
                 held_ = newer;
+                ++skipped;
             }
             auto size = held_.ContentSize();
             if (size.Width != size_.Width || size.Height != size_.Height)
@@ -87,6 +118,9 @@ class Wgc final : public ICapture {
             Frame result;
             check(access->GetInterface(IID_PPV_ARGS(&result.texture)), "WGC GPU texture");
             result.timestamp = now100ns();
+            // SystemRelativeTime is QPC-based, like steady_clock: the compositor's own stamp for this frame.
+            result.presented = held_.SystemRelativeTime().count();
+            result.accumulated = 1 + skipped;
             return result;
         } catch (const winrt::hresult_error &e) {
             rethrow(e, "Windows Graphics Capture frame failed (display changed; rebuilding capture)");

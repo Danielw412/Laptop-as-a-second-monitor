@@ -1,6 +1,7 @@
 #include "pipeline.hpp"
 #include "logging.hpp"
 #include "pattern.hpp"
+#include <avrt.h>
 #include <d3d11_1.h>
 #include <fstream>
 #include <winrt/base.h>
@@ -46,6 +47,32 @@ class CpuMeter {
         return result;
     }
 };
+// Puts the engine thread into the multimedia scheduling class (MMCSS) for the lifetime of the loop, so a busy
+// desktop application cannot hold up capture or encoder servicing for a scheduler quantum. Falls back to a plain
+// priority boost where MMCSS is unavailable.
+class RealtimeScope {
+    HANDLE task_ = nullptr;
+    int previous_ = THREAD_PRIORITY_NORMAL;
+
+  public:
+    RealtimeScope() {
+        DWORD index = 0;
+        task_ = AvSetMmThreadCharacteristicsW(L"Capture", &index);
+        if (!task_) {
+            previous_ = GetThreadPriority(GetCurrentThread());
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
+    ~RealtimeScope() {
+        if (task_)
+            AvRevertMmThreadCharacteristics(task_);
+        else
+            SetThreadPriority(GetCurrentThread(), previous_);
+    }
+    const char *description() const {
+        return task_ ? "MMCSS Capture" : "above-normal priority";
+    }
+};
 nlohmann::json optionalNumber(const std::optional<double> &v) {
     return v ? nlohmann::json(*v) : nlohmann::json(nullptr);
 }
@@ -63,6 +90,20 @@ const char *modeName(PipelineMode m) {
         return "stream";
     }
 }
+// Cheap check that the selected output still is where it was. The capture backends fail loudly on real changes;
+// this only catches a silent move or primary swap, without re-enumerating DXGI on the frame thread.
+bool sameMonitor(const Display &d) {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(d.monitor, &mi))
+        return false;
+    return memcmp(&mi.rcMonitor, &d.rect, sizeof(RECT)) == 0 &&
+           ((mi.dwFlags & MONITORINFOF_PRIMARY) != 0) == d.primary && utf8(mi.szDevice) == d.name;
+}
+// Frames inside the encoder at once. A keyframe takes 20-30 ms on an integrated GPU; with three in flight the
+// two frames arriving meanwhile queue up briefly instead of being dropped, and the queue drains within ~50 ms.
+constexpr unsigned kMaxInFlight = 3;
+static_assert(kMaxInFlight < Converter::slots(), "the NV12 ring must exceed the encoder queue depth");
 } // namespace
 PipelineMode parseMode(const std::string &s) {
     if (s == "capture")
@@ -161,13 +202,18 @@ void StreamingEngine::loop() {
             throw std::runtime_error("Cannot open CSV");
         csv << "seconds,captured,encoded,dropped,no_change,capture_ms_mean,capture_ms_p95,capture_ms_p99,"
                "convert_submit_ms_mean,encode_ms_mean,encode_ms_p95,encode_ms_p99,frame_bytes_mean,bitrate,"
-               "queue_depth\n";
+               "queue_depth,acquire_delay_ms_mean,acquire_delay_ms_p95,source_to_encoded_ms_mean,"
+               "source_to_encoded_ms_p95,pipeline_ms_mean,pipeline_ms_p95,wakeups_per_s,loop_max_ms,send_ms_mean,"
+               "send_ms_max,submit_interval_ms_p95,submit_interval_ms_max,frame_bytes_max,keyframes,cpu_percent,"
+               "capture_fps,encode_fps\n";
     }
     auto start = Clock::now();
     const int64_t epoch = now100ns();
     PollTimer pollTimer;
     CpuMeter cpu;
     cpu.sample();
+    RealtimeScope realtime;
+    logInfo(std::string("Streaming engine thread scheduling: ") + realtime.description());
     uint32_t configuredBitrate = o.bitrate.initial;
     auto lastEncoderChange = Clock::now();
     bool hadDisplay = false, reportedMissing = false;
@@ -235,15 +281,15 @@ void StreamingEngine::loop() {
             Device device(selected);
             std::unique_ptr<Pattern> pattern;
             if (o.pattern)
-                pattern = std::make_unique<Pattern>(device, selected);
+                pattern = std::make_unique<Pattern>(selected);
             std::unique_ptr<ICapture> capture;
             CaptureBackend used = resolved_;
             if (!o.synthetic && o.mode != PipelineMode::Encode) {
                 if (used == CaptureBackend::Auto)
                     used = o.backend;
                 if (used == CaptureBackend::Auto) {
-                    // Auto prefers Windows Graphics Capture (no merged-frame drops in the baseline runs) and falls
-                    // back to desktop duplication where it is unavailable.
+                    // Auto prefers Windows Graphics Capture (frame-arrival events, cursor included) and falls back
+                    // to desktop duplication where it is unavailable.
                     try {
                         capture = wgc(device, selected);
                         used = CaptureBackend::Wgc;
@@ -261,7 +307,7 @@ void StreamingEngine::loop() {
             if (o.mode != PipelineMode::Capture)
                 converter = std::make_unique<Converter>(device, iw, ih, ow, oh);
             if (o.mode == PipelineMode::Encode || o.mode == PipelineMode::CaptureEncode || stream)
-                encoder = hardwareEncoder(device, selected, ow, oh, o.fps, configuredBitrate);
+                encoder = hardwareEncoder(device, selected, ow, oh, o.fps, configuredBitrate, kMaxInFlight);
             const std::string backendLabel =
                 o.synthetic || o.mode == PipelineMode::Encode ? "Generated GPU source" : backendName(used);
             logInfo("Pipeline: " + backendLabel + " -> GPU NV12 -> " + (encoder ? encoder->name() : "benchmark") +
@@ -284,16 +330,29 @@ void StreamingEngine::loop() {
                     transport_->fillMetrics(s);
                 publish(s);
             }
-            uint64_t captured = 0, encoded = 0, dropped = 0, noChange = 0, previousCaptured = 0,
+            uint64_t captured = 0, encoded = 0, dropped = 0, noChange = 0, paced = 0, previousCaptured = 0,
                      previousEncoded = 0;
-            Samples<> capTimes, conversionTimes, encodeTimes, pipelineTimes, sizes;
+            Samples<> capTimes, conversionTimes, encodeTimes, pipelineTimes, sizes, acquireDelays, sourceToEncoded,
+                sendTimes, submitIntervals;
+            uint64_t iterations = 0, previousIterations = 0, keyframes = 0;
+            double loopMaxMs = 0, sendMaxMs = 0, frameBytesMax = 0;
+            std::optional<Clock::time_point> lastSubmit;
+            bool sourceTimeWarned = false;
             uint32_t bitrate = configuredBitrate, attemptedBitrate = configuredBitrate;
             bool dynamicBitrate = true;
-            auto report = Clock::now(), next = Clock::now(), lastInput = Clock::now();
+            auto report = Clock::now(), next = Clock::now(), lastInput = Clock::now(), lastFullCheck = Clock::now(),
+                 lastBitrateSwitch = Clock::now();
             ComPtr<ID3D11Texture2D> synthetic;
             ComPtr<ID3D11RenderTargetView> syntheticView;
             ComPtr<ID3D11DeviceContext1> context1;
             bool keyframePending = true, haveSurface = false, repeatRequested = false;
+            // Frame pacing state. Frames are taken the moment the compositor delivers them (event-driven); the
+            // configured rate only thins them out, it never schedules them.
+            const int64_t period100ns = 10000000 / o.fps;
+            const auto period = std::chrono::nanoseconds(1000000000 / o.fps);
+            int64_t lastAccepted = 0, lastSampleTime = -1;
+            size_t slot = 0, lastSlot = 0;
+            std::optional<Frame> carried; // Taken from the capture but not yet accepted by the encoder
             if (o.mode == PipelineMode::Encode || o.synthetic) {
                 D3D11_TEXTURE2D_DESC d{};
                 d.Width = iw;
@@ -313,6 +372,68 @@ void StreamingEngine::loop() {
                 }
             }
             while (!stop_ && !timeUp()) {
+                // ---- Sleep until there is something to do: a frame, encoder news, a transport message, or the
+                // housekeeping deadline. Nothing here spins on a timer while connected.
+                const bool active = !transport_ || transport_->connected();
+                const bool busy = encoder && (encoder->pending() || carried);
+                std::optional<Frame> frame;
+                bool fresh = false;
+                if (synthetic) {
+                    auto now = Clock::now();
+                    if (now < next) {
+                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(next - now).count();
+                        HANDLE handles[2];
+                        DWORD n = 0;
+                        if (encoder)
+                            handles[n++] = encoder->event();
+                        if (transport_)
+                            handles[n++] = transport_->wakeEvent();
+                        if (n && ms > 0)
+                            WaitForMultipleObjects(n, handles, FALSE, DWORD(ms));
+                        else
+                            pollTimer.wait(unsigned(std::max<long long>(1, ms)));
+                        now = Clock::now();
+                    }
+                    if (now >= next && active) {
+                        next += period;
+                        if (next < now)
+                            next = now + period;
+                        frame = Frame{synthetic, now100ns(), now100ns(), 1};
+                    }
+                } else if (capture && active && !capture->frameEvent()) {
+                    // Desktop duplication has no event: block inside AcquireNextFrame, checking the encoder every
+                    // millisecond while a frame is in flight. A carried frame must stay acquired, so only wait.
+                    if (carried) {
+                        HANDLE handles[2];
+                        DWORD n = 0;
+                        if (encoder)
+                            handles[n++] = encoder->event();
+                        if (transport_)
+                            handles[n++] = transport_->wakeEvent();
+                        if (n)
+                            WaitForMultipleObjects(n, handles, FALSE, 1);
+                    } else
+                        frame = capture->acquire(busy ? 1 : 8);
+                } else {
+                    HANDLE handles[3];
+                    DWORD n = 0;
+                    if (capture && active)
+                        handles[n++] = capture->frameEvent();
+                    if (encoder)
+                        handles[n++] = encoder->event();
+                    if (transport_)
+                        handles[n++] = transport_->wakeEvent();
+                    const DWORD timeout = active ? 50 : 20;
+                    const DWORD r = n ? WaitForMultipleObjects(n, handles, FALSE, timeout) : WAIT_TIMEOUT;
+                    if (!n)
+                        pollTimer.wait(timeout);
+                    const bool frameSignalled = capture && active && r == WAIT_OBJECT_0;
+                    // A carried frame is only replaced once a newer one has actually arrived.
+                    if (capture && active && (!carried || frameSignalled))
+                        frame = capture->acquire(0);
+                }
+                const auto iterationStart = Clock::now();
+                ++iterations;
                 MSG msg;
                 while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                     TranslateMessage(&msg);
@@ -343,6 +464,16 @@ void StreamingEngine::loop() {
                         }
                     }
                 }
+                if (encoder && o.bitrateSwitchSeconds &&
+                    Clock::now() - lastBitrateSwitch >= std::chrono::seconds(o.bitrateSwitchSeconds)) {
+                    // Bench experiment: does the encoder really follow a live bitrate change? Watch frame sizes.
+                    lastBitrateSwitch = Clock::now();
+                    const uint32_t target = bitrate == o.bitrate.maximum ? o.bitrate.minimum : o.bitrate.maximum;
+                    const bool ok = encoder->bitrate(target);
+                    logInfo("Bitrate switch to " + std::to_string(target) + " bps: " + (ok ? "accepted" : "rejected"));
+                    if (ok)
+                        bitrate = target;
+                }
                 if (encoder) {
                     if (keyframePending) {
                         encoder->keyframe();
@@ -350,87 +481,139 @@ void StreamingEngine::loop() {
                     }
                     for (auto &f : encoder->poll()) {
                         ++encoded;
+                        const auto done = now100ns();
                         encodeTimes.add(f.latencyMs);
-                        pipelineTimes.add((now100ns() - epoch - f.timestamp) / 10000.0);
+                        pipelineTimes.add((done - epoch - f.timestamp) / 10000.0);
+                        if (f.presented)
+                            sourceToEncoded.add((done - f.presented) / 10000.0);
                         sizes.add(double(f.bytes.size()));
-                        if (transport_)
+                        frameBytesMax = std::max(frameBytesMax, double(f.bytes.size()));
+                        if (f.keyframe)
+                            ++keyframes;
+                        if (transport_) {
+                            const auto sendStart = Clock::now();
                             transport_->send(f);
+                            const auto sendMs =
+                                std::chrono::duration<double, std::milli>(Clock::now() - sendStart).count();
+                            sendTimes.add(sendMs);
+                            sendMaxMs = std::max(sendMaxMs, sendMs);
+                        }
                     }
                     if (encoder->pending() && Clock::now() - lastInput > std::chrono::seconds(3))
                         throw std::runtime_error("Encoder stalled; recreating GPU pipeline");
                 }
                 auto now = Clock::now();
-                if (now >= next) {
-                    if (pattern)
-                        pattern->draw();
-                    next += std::chrono::nanoseconds(1000000000 / o.fps);
-                    if (next < now)
-                        next = now + std::chrono::nanoseconds(1000000000 / o.fps);
-                    bool active = !transport_ || transport_->connected();
-                    if (active) {
-                        // Do not consume the first unchanged desktop frame before the encoder can accept it.
-                        if (encoder && !encoder->ready()) {
-                            pollTimer.wait();
-                            continue;
+                if (frame) {
+                    fresh = true;
+                    ++captured;
+                    if (frame->accumulated > 1)
+                        dropped += frame->accumulated - 1;
+                    if (carried) {
+                        // Superseded by a newer frame before the encoder could take it.
+                        ++dropped;
+                        carried.reset();
+                    }
+                    if (frame->presented) {
+                        const double waited = (frame->timestamp - frame->presented) / 10000.0;
+                        if (waited < -50 || waited > 5000) {
+                            // Not on our clock: ignore the source stamp rather than report nonsense.
+                            if (!sourceTimeWarned)
+                                logWarning("Capture source timestamps are not comparable to the host clock");
+                            sourceTimeWarned = true;
+                            frame->presented = 0;
+                        } else
+                            acquireDelays.add(waited);
+                    }
+                    if (!synthetic) {
+                        // Time from the compositor's stamp to this thread taking the frame, in the historical
+                        // "capture latency" column; the acquire call itself is no longer where frames wait.
+                        capTimes.add(frame->presented ? (frame->timestamp - frame->presented) / 10000.0 : 0.0);
+                        D3D11_TEXTURE2D_DESC fd{};
+                        frame->texture->GetDesc(&fd);
+                        if (fd.Width != iw || fd.Height != ih)
+                            throw std::runtime_error("Display dimensions changed; recreate pipeline");
+                    }
+                } else if (carried) {
+                    frame = carried;
+                    carried.reset();
+                } else if (capture && active)
+                    ++noChange;
+                if (frame) {
+                    // Timestamps come from the compositor when it provides them: evenly spaced RTP timestamps
+                    // instead of ones that carry this thread's scheduling jitter.
+                    const int64_t stamp = frame->presented ? frame->presented : frame->timestamp;
+                    if (fresh && o.fps < 60 && lastAccepted && stamp - lastAccepted < period100ns * 3 / 4) {
+                        ++paced; // Rate limiter for the 30 fps setting: skip frames that came too soon.
+                        if (capture)
+                            capture->release();
+                    } else if (!converter) {
+                        if (capture)
+                            capture->release();
+                    } else if (encoder && !encoder->ready()) {
+                        carried = frame; // Keep it (and its capture buffer) until the encoder frees up.
+                    } else {
+                        auto t = Clock::now();
+                        if (o.synthetic) {
+                            float background[4]{.04f, .08f, .12f, 1}, foreground[4]{.3f, .85f, .6f, 1};
+                            device.context->ClearRenderTargetView(syntheticView.Get(), background);
+                            LONG x = LONG((captured * 12) % (iw - 100));
+                            D3D11_RECT rect{x, 0, x + 100, LONG(ih)};
+                            context1->ClearView(syntheticView.Get(), foreground, &rect, 1);
                         }
-                        auto begin = Clock::now();
-                        std::optional<Frame> frame;
-                        if (synthetic)
-                            frame = Frame{synthetic, now100ns(), 1};
-                        else
-                            frame = capture->acquire();
-                        capTimes.add(std::chrono::duration<double, std::milli>(Clock::now() - begin).count());
-                        if (frame) {
-                            ++captured;
-                            if (frame->accumulated > 1)
-                                dropped += frame->accumulated - 1;
-                            D3D11_TEXTURE2D_DESC fd{};
-                            frame->texture->GetDesc(&fd);
-                            if (fd.Width != iw || fd.Height != ih)
-                                throw std::runtime_error("Display dimensions changed; recreate pipeline");
-                            if (converter) {
-                                if (encoder && !encoder->ready())
+                        // Rotate through the NV12 ring so converting this frame never touches the surface the
+                        // encoder is still reading for the previous one.
+                        ID3D11Texture2D *nv12 = nullptr;
+                        if (o.mode == PipelineMode::Encode)
+                            nv12 = converter->texture(0);
+                        else {
+                            slot = (slot + 1) % Converter::slots();
+                            nv12 = converter->texture(slot);
+                        }
+                        if (encoder && o.mode != PipelineMode::Encode && encoder->holds(nv12)) {
+                            ++dropped; // Encoder is more than a ring behind: drop rather than overwrite.
+                            if (capture)
+                                capture->release();
+                        } else {
+                            if (o.mode != PipelineMode::Encode) {
+                                converter->convert(frame->texture.Get(), slot);
+                                if (o.flushGpu)
+                                    device.context->Flush();
+                                conversionTimes.add(
+                                    std::chrono::duration<double, std::milli>(Clock::now() - t).count());
+                            }
+                            lastAccepted = stamp;
+                            haveSurface = true;
+                            if (encoder) {
+                                const int64_t sampleTime = std::max(stamp - epoch, lastSampleTime + 1);
+                                if (!encoder->submit(nv12, sampleTime, frame->presented))
                                     ++dropped;
                                 else {
-                                    auto t = Clock::now();
-                                    if (o.synthetic) {
-                                        float background[4]{.04f, .08f, .12f, 1}, foreground[4]{.3f, .85f, .6f, 1};
-                                        device.context->ClearRenderTargetView(syntheticView.Get(), background);
-                                        LONG x = LONG((captured * 12) % (iw - 100));
-                                        D3D11_RECT rect{x, 0, x + 100, LONG(ih)};
-                                        context1->ClearView(syntheticView.Get(), foreground, &rect, 1);
-                                    }
-                                    auto nv12 = o.mode == PipelineMode::Encode
-                                                    ? converter->texture(0)
-                                                    : converter->convert(frame->texture.Get(), 0);
-                                    if (o.flushGpu)
-                                        device.context->Flush();
-                                    if (o.mode != PipelineMode::Encode)
-                                        conversionTimes.add(
-                                            std::chrono::duration<double, std::milli>(Clock::now() - t).count());
-                                    haveSurface = true;
-                                    if (encoder) {
-                                        if (!encoder->submit(nv12, frame->timestamp - epoch))
-                                            ++dropped;
-                                        else {
-                                            lastInput = now;
-                                            repeatRequested = false;
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            ++noChange;
-                            if (encoder && haveSurface && encoder->ready() &&
-                                (repeatRequested || now - lastInput > std::chrono::seconds(1))) {
-                                if (encoder->submit(converter->texture(0), now100ns() - epoch)) {
+                                    lastSampleTime = sampleTime;
+                                    lastSlot = o.mode == PipelineMode::Encode ? 0 : slot;
+                                    if (lastSubmit)
+                                        submitIntervals.add(
+                                            std::chrono::duration<double, std::milli>(t - *lastSubmit).count());
+                                    lastSubmit = t;
                                     lastInput = now;
                                     repeatRequested = false;
                                 }
                             }
+                            if (capture)
+                                capture->release();
                         }
-                        if (capture)
-                            capture->release();
+                    }
+                } else if (encoder && haveSurface && active && encoder->ready() &&
+                           (repeatRequested || now - lastInput > std::chrono::seconds(1))) {
+                    // Static desktop: keep the receiver alive, and answer keyframe requests without waiting for
+                    // the desktop to change.
+                    auto *last = converter->texture(lastSlot);
+                    if (!encoder->holds(last)) {
+                        const int64_t sampleTime = std::max(now100ns() - epoch, lastSampleTime + 1);
+                        if (encoder->submit(last, sampleTime, 0)) {
+                            lastSampleTime = sampleTime;
+                            lastInput = now;
+                            repeatRequested = false;
+                        }
                     }
                 }
                 if (now - report >= std::chrono::seconds(1)) {
@@ -457,6 +640,22 @@ void StreamingEngine::loop() {
                     }
                     if (converter && converter->gpuTimes().count())
                         s.gpuSpanMsMean = converter->gpuTimes().mean();
+                    if (acquireDelays.count()) {
+                        s.acquireDelayMsMean = acquireDelays.mean();
+                        s.acquireDelayMsP95 = acquireDelays.percentile(.95);
+                    }
+                    if (sourceToEncoded.count()) {
+                        s.sourceToEncodedMsMean = sourceToEncoded.mean();
+                        s.sourceToEncodedMsP95 = sourceToEncoded.percentile(.95);
+                    }
+                    s.loopWakeupsPerSecond = (iterations - previousIterations) / interval;
+                    s.loopMaxMs = loopMaxMs;
+                    s.sendMsMean = sendTimes.mean();
+                    s.sendMsMax = sendMaxMs;
+                    s.submitIntervalMsP95 = submitIntervals.percentile(.95);
+                    s.submitIntervalMsMax = submitIntervals.count() ? submitIntervals.percentile(1.0) : 0;
+                    s.frameBytesMax = frameBytesMax;
+                    s.keyframes = keyframes;
                     s.frameBytesMean = sizes.mean();
                     s.bitrate = bitrate;
                     s.targetBitrate = transport_ ? transport_->targetBitrate() : bitrate;
@@ -479,6 +678,7 @@ void StreamingEngine::loop() {
                                             {"encoded", encoded},
                                             {"dropped", dropped},
                                             {"no_change", noChange},
+                                            {"paced", paced},
                                             {"capture_ms_mean", capTimes.mean()},
                                             {"capture_ms_p95", capTimes.percentile(.95)},
                                             {"capture_ms_p99", capTimes.percentile(.99)},
@@ -501,7 +701,20 @@ void StreamingEngine::loop() {
                                             {"target_bitrate", s.targetBitrate},
                                             {"flush_gpu", o.flushGpu},
                                             {"pipeline_ms_mean", optionalNumber(s.pipelineMsMean)},
-                                            {"pipeline_ms_p95", optionalNumber(s.pipelineMsP95)}};
+                                            {"pipeline_ms_p95", optionalNumber(s.pipelineMsP95)},
+                                            {"acquire_delay_ms_mean", optionalNumber(s.acquireDelayMsMean)},
+                                            {"acquire_delay_ms_p95", optionalNumber(s.acquireDelayMsP95)},
+                                            {"source_to_encoded_ms_mean", optionalNumber(s.sourceToEncodedMsMean)},
+                                            {"source_to_encoded_ms_p95", optionalNumber(s.sourceToEncodedMsP95)},
+                                            {"wakeups_per_s", s.loopWakeupsPerSecond},
+                                            {"loop_max_ms", s.loopMaxMs},
+                                            {"send_ms_mean", s.sendMsMean},
+                                            {"send_ms_max", s.sendMsMax},
+                                            {"submit_interval_ms_p95", s.submitIntervalMsP95},
+                                            {"submit_interval_ms_max", s.submitIntervalMsMax},
+                                            {"frame_bytes_max", s.frameBytesMax},
+                                            {"keyframes", keyframes},
+                                            {"pattern_presented", pattern ? pattern->presented() : 0}};
                     if (converter && converter->gpuTimes().count()) {
                         // This asynchronous GPU command span includes driver submission delay.
                         // It is not a pure video-processor execution duration.
@@ -515,25 +728,44 @@ void StreamingEngine::loop() {
                         o.statsSink(stats);
                     previousCaptured = captured;
                     previousEncoded = encoded;
-                    if (csv)
+                    previousIterations = iterations;
+                    if (csv) {
+                        auto opt = [](const std::optional<double> &v) { return v ? *v : 0.0; };
                         csv << elapsed << ',' << captured << ',' << encoded << ',' << dropped << ',' << noChange
                             << ',' << capTimes.mean() << ',' << capTimes.percentile(.95) << ','
                             << capTimes.percentile(.99) << ',' << conversionTimes.mean() << ','
                             << encodeTimes.mean() << ',' << encodeTimes.percentile(.95) << ','
                             << encodeTimes.percentile(.99) << ',' << sizes.mean() << ',' << bitrate << ','
-                            << (encoder ? encoder->pending() : 0) << '\n';
+                            << (encoder ? encoder->pending() : 0) << ',' << opt(s.acquireDelayMsMean) << ','
+                            << opt(s.acquireDelayMsP95) << ',' << opt(s.sourceToEncodedMsMean) << ','
+                            << opt(s.sourceToEncodedMsP95) << ',' << opt(s.pipelineMsMean) << ','
+                            << opt(s.pipelineMsP95) << ',' << s.loopWakeupsPerSecond << ',' << s.loopMaxMs << ','
+                            << s.sendMsMean << ',' << s.sendMsMax << ',' << s.submitIntervalMsP95 << ','
+                            << s.submitIntervalMsMax << ',' << s.frameBytesMax << ',' << keyframes << ','
+                            << opt(s.cpuPercent) << ',' << s.captureFps << ',' << s.encodeFps << '\n';
+                    }
+                    loopMaxMs = 0;
+                    sendMaxMs = 0;
+                    frameBytesMax = 0;
                     report = now;
-                    auto current = displays();
-                    auto found = std::find_if(current.begin(), current.end(),
-                                              [&](auto &d) { return d.name == selected.name; });
-                    if (found == current.end() || found->monitor != selected.monitor ||
-                        found->primary != selected.primary ||
-                        memcmp(&found->rect, &selected.rect, sizeof(RECT)) ||
-                        memcmp(&found->luid, &selected.luid, sizeof(LUID)))
+                    // Topology: a cheap GDI check every second; the full DXGI enumeration (a multi-millisecond
+                    // stall on this thread) only every ten seconds, to notice a GPU change as well.
+                    if (!sameMonitor(selected))
                         throw std::runtime_error("Display topology changed; revalidate selection");
+                    if (now - lastFullCheck >= std::chrono::seconds(10)) {
+                        lastFullCheck = now;
+                        auto current = displays();
+                        auto found = std::find_if(current.begin(), current.end(),
+                                                  [&](auto &d) { return d.name == selected.name; });
+                        if (found == current.end() || found->monitor != selected.monitor ||
+                            found->primary != selected.primary ||
+                            memcmp(&found->rect, &selected.rect, sizeof(RECT)) ||
+                            memcmp(&found->luid, &selected.luid, sizeof(LUID)))
+                            throw std::runtime_error("Display topology changed; revalidate selection");
+                    }
                 }
-                // Poll async output promptly; do not wait a full frame period to transmit it.
-                pollTimer.wait(transport_ && !transport_->connected() ? 20 : 1);
+                loopMaxMs = std::max(
+                    loopMaxMs, std::chrono::duration<double, std::milli>(Clock::now() - iterationStart).count());
             }
         } catch (const std::exception &e) {
             logWarning(e.what());

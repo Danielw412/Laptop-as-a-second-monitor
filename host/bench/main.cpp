@@ -14,7 +14,7 @@ BOOL WINAPI control(DWORD) {
 }
 struct Options {
     std::string display, backend = "auto", mode = "capture-encode", server = kDefaultSignalingUrl, csv;
-    unsigned fps = 60, seconds = 0;
+    unsigned fps = 60, seconds = 0, bitrateSwitch = 0;
     bool list = false, allowPrimary = false, pattern = false, synthetic = false, flushGpu = false,
          browserMon = false;
     TransportTestOptions test;
@@ -44,6 +44,8 @@ Options parse(int argc, char **argv) {
             o.test.blockIce = true;
         else if (a == "--flush-gpu")
             o.flushGpu = true;
+        else if (a == "--test-bitrate-switch")
+            o.bitrateSwitch = std::stoul(value());
         else if (a == "--display")
             o.display = value();
         else if (a == "--capture")
@@ -97,6 +99,7 @@ int run(int argc, char **argv) {
     config.flushGpu = o.flushGpu;
     config.allowPrimary = o.allowPrimary;
     config.seconds = o.seconds;
+    config.bitrateSwitchSeconds = o.bitrateSwitch;
     config.csvPath = o.csv;
     config.test = o.test;
     config.signalingUrl = o.server;
@@ -168,7 +171,8 @@ int main(int argc, char **argv) {
                   << "\nUsage: browser-monitor-bench --list\n"
                      "  --browsermon | --display \\\\.\\DISPLAYn\n"
                      "  --mode capture|convert|encode|capture-encode|stream --capture auto|dxgi|wgc --fps 60\n"
-                     "  --seconds 30 --csv results.csv --pattern --synthetic --allow-primary\n";
+                     "  --seconds 30 --csv results.csv --pattern --synthetic --allow-primary\n"
+                     "  --test-bitrate-switch 5 (alternate encoder bitrate every 5 s)\n";
         return 1;
     }
 }

@@ -19,6 +19,7 @@ struct EngineConfig {
     BitratePlan bitrate = bitratePlan(QualityPreset::Balanced);
     bool pattern = false, synthetic = false, flushGpu = false, allowPrimary = false;
     unsigned seconds = 0;   // Bench: stop after this long (0 = until stopped)
+    unsigned bitrateSwitchSeconds = 0; // Bench: alternate the encoder bitrate between plan min/max every N s
     std::string csvPath;    // Bench: per-second CSV
     std::string signalingUrl, hostSecret;
     TransportTestOptions test;

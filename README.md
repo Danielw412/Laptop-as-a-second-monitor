@@ -89,9 +89,10 @@ reconnecting, red error, grey stopped. A balloon appears when the receiver conne
 - **Overview**: pairing code with countdown, four status rows (virtual display, streaming, receiver, signaling),
   six headline metrics, the controls above.
 - **Details**: capture/encode/receiver FPS, encoder and receiver bitrate, RTT, jitter, packet loss, dropped frames,
-  capture, encode and capture-to-encoded latency, encoder queue and keyframes, connection duration, sent
-  frames/bytes, signaling and WebRTC state, GPU, encoder, capture backend, video path (GPU, no CPU readback), host
-  CPU, setup status. *Copy diagnostics* puts all of it plus the recent log on the clipboard; *Open log folder* opens
+  capture, encode and frame-to-encoded latency (measured from the compositor's own frame stamp), how long frames
+  waited before capture, the receiver's jitter-buffer and decode delay, encoder queue and keyframes, connection
+  duration, sent frames/bytes, signaling and WebRTC state, GPU, encoder, capture backend, video path (GPU, no CPU
+  readback), host CPU, setup status. *Copy diagnostics* puts all of it plus the recent log on the clipboard; *Open log folder* opens
   `%LOCALAPPDATA%\BrowserMonitor\logs`.
 - **Settings**: start at sign-in, start the virtual display automatically, keep running in the tray on close,
   diagnostics log, capture backend (Auto prefers Windows Graphics Capture and falls back to DXGI duplication),
@@ -170,6 +171,25 @@ tests/                    vitest (protocol, telemetry) and the signaling integra
 - Bench: `browser-monitor-bench --list`, then e.g.
   `browser-monitor-bench --browsermon --capture wgc --mode capture-encode --pattern --seconds 20 --csv out.csv`.
   `--mode stream` pairs like the app (prints the code on the console). `benchmarks/run.ps1` runs the matrix.
+  `--pattern` draws a vsync-paced moving bar on the selected display (exactly one new frame per refresh), so
+  capture FPS can be compared with the display's refresh rate. `--test-bitrate-switch N` alternates the encoder
+  bitrate between the preset's minimum and maximum every N seconds to check whether a live change takes effect
+  (watch `frame_bytes_mean`). Per-second JSON/CSV columns include `acquire_delay_ms` (compositor stamp to
+  capture), `source_to_encoded_ms`, `wakeups_per_s`, `loop_max_ms`, `submit_interval_ms`, `send_ms`,
+  `frame_bytes_max`, `keyframes` and the receiver's `jitterBufferMs`, `decodeMs` and `processingMs`.
+
+### How the frame loop is paced
+
+The engine thread never polls for frames on a timer. Windows Graphics Capture signals an event the moment the
+compositor hands over a frame, the hardware encoder signals one for every event it raises (input wanted, output
+ready, input surface released), and the transport signals one for signaling or telemetry messages; the loop sleeps
+on those three handles. Desktop duplication has no event, so that backend blocks inside `AcquireNextFrame`. Each
+frame is converted into a four-surface NV12 ring and handed to the encoder with the compositor's timestamp, up to
+three frames may be inside the encoder at once (a keyframe takes 20-30 ms on an integrated GPU and would otherwise
+cost the next two frames), and the thread runs in the MMCSS "Capture" scheduling class. RTP packets carry the
+playout-delay header extension set to zero so the browser renders each frame as soon as it is decoded. The Intel
+encoder accepts but ignores live bitrate changes, so bitrate adaptation still recreates the encoder; the periodic
+keyframe interval is 10 s (keyframes are otherwise produced on demand: viewer join, PLI, transport drop).
 
 Logs go to `%LOCALAPPDATA%\BrowserMonitor\logs\host.log` (2 MB rotation) and `setup.log`; they never contain codes
 or credentials.
