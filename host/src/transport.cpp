@@ -209,8 +209,9 @@ class Transport final : public ITransport {
         auto epoch = ++socketEpoch_;
         socket_->onOpen([box, epoch] { box->push({{"event", "socket-open"}, {"socket", epoch}}); });
         socket_->onClosed([box, epoch] { box->push({{"event", "socket-close"}, {"socket", epoch}}); });
-        socket_->onError(
-            [box, epoch](std::string) { box->push({{"event", "socket-close"}, {"socket", epoch}}); });
+        socket_->onError([box, epoch](std::string error) {
+            box->push({{"event", "socket-close"}, {"socket", epoch}, {"error", std::move(error)}});
+        });
         socket_->onMessage([box, epoch](rtc::message_variant message) {
             if (auto text = std::get_if<std::string>(&message); text && text->size() <= 24576) {
                 try {
@@ -342,14 +343,19 @@ class Transport final : public ITransport {
                     socket_->send(
                         Json{{"type", "auth"}, {"version", 2}, {"role", "host"}, {"secret", secret_}}.dump());
                 else if (event == "socket-close") {
+                    // onError and onClosed both report the same socket; handle it once.
+                    const bool first = retry_ == Clock::time_point::max();
                     reset();
                     setViewer(false);
                     if (signaling_ != SignalingState::Rejected)
                         setSignaling(SignalingState::Disconnected);
-                    if (retry_ == Clock::time_point::max())
+                    if (first)
                         retry_ = Clock::now() + std::chrono::milliseconds(
                                                     std::min(10000u, 500u << std::min(attempts_++, 5u)));
-                    if (!fatal_)
+                    if (m.contains("error"))
+                        logWarning("Signaling connection to " + url_ + " failed: " + m["error"].get<std::string>() +
+                                   ". A firewall, web filter or TLS-inspecting proxy may be blocking it.");
+                    else if (first && !fatal_)
                         logInfo("Signaling disconnected; retrying");
                 } else if (event == "signal") {
                     auto &body = m["body"];
