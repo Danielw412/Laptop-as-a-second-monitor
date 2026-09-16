@@ -6,7 +6,7 @@
 #include "ui/tray.hpp"
 #include <memory>
 #include <vector>
-namespace bm::app::ui {
+namespace lm::app::ui {
 class MainWindow {
   public:
     MainWindow(HINSTANCE instance, bool startHidden, SettingsStore store, Settings settings, std::string hostSecret);
@@ -41,6 +41,7 @@ class MainWindow {
         SetBackend,
         SetFps,
         SetQuality,
+        SetScale,
         ResetUrl,
         Retry,
     };
@@ -64,7 +65,7 @@ class MainWindow {
     Page page_ = Page::Overview;
     std::vector<Control> controls_;
     Id hover_ = Id::None, pressed_ = Id::None, focus_ = Id::None;
-    bool startHidden_, exitTimerArmed_ = false, tracking_ = false;
+    bool startHidden_, exitTimerArmed_ = false, tracking_ = false, destroying_ = false;
     float dpi_ = 96.f;
     std::wstring toast_;
     UINT taskbarCreated_ = 0;
@@ -101,4 +102,4 @@ class MainWindow {
     RECT toPixels(const D2D1_RECT_F &r) const;
     std::wstring viewerUrlText() const;
 };
-} // namespace bm::app::ui
+} // namespace lm::app::ui

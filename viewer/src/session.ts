@@ -15,10 +15,10 @@ export type Credentials =
   | { role: "host"; room: string; secret: string; code: string };
 export type Paired = { room?: string; token?: string };
 export const ERROR_TEXT: Record<string, string> = {
-  "invalid-code": "That code was not recognized or has expired. Check the code shown in Browser Monitor and try again.",
+  "invalid-code": "That code was not recognized or has expired. Check the code shown in Laptop Monitor and try again.",
   "rate-limit": "Too many attempts. Wait a minute, then enter the current code.",
-  "viewer-occupied": "Another receiver is already connected to this Browser Monitor.",
-  authentication: "This session is no longer valid. Enter the current code from Browser Monitor.",
+  "viewer-occupied": "Another receiver is already connected to this Laptop Monitor.",
+  authentication: "This session is no longer valid. Enter the current code from Laptop Monitor.",
   malformed: "The signaling server rejected a message.",
   role: "The signaling server rejected a message.",
   version: "This receiver and the signaling server speak different protocol versions.",
@@ -90,7 +90,7 @@ export class Session {
     // A token outlives the code it was obtained with, so resuming prefers it over the code.
     if (this.room && (this.token || this.credentials.role === "host")) this.open(url, undefined);
     else if (this.credentials.role === "viewer" && "code" in this.credentials) void this.pair(url, this.credentials.code);
-    else throw Error("Enter the pairing code shown in Browser Monitor.");
+    else throw Error("Enter the pairing code shown in Laptop Monitor.");
   }
   /** Exchanges the code for a room and a one-time ticket. The code travels in a request body, never in a URL. */
   private async pair(url: URL, code: string) {
@@ -113,7 +113,7 @@ export class Session {
     if (this.stopped || attempt !== this.started) return;
     if ("error" in result) {
       if (result.error === "host-unavailable") {
-        this.status("Browser Monitor is not running on the host yet. Waiting…");
+        this.status("Laptop Monitor is not running on the host yet. Waiting…");
         this.scheduleRetry();
         return;
       }
@@ -197,7 +197,7 @@ export class Session {
   private async message(m: ServerMessage) {
     if (m.type === "error") {
       if (m.code === "host-unavailable") {
-        this.status("Browser Monitor is not running on the host yet. Waiting…");
+        this.status("Laptop Monitor is not running on the host yet. Waiting…");
         this.ws?.close();
         return;
       }

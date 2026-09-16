@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-namespace bm {
+namespace lm {
 enum class Phase {
     SetupRequired,
     Idle,          // Virtual display off, nothing streaming
@@ -56,7 +56,7 @@ enum class EventType {
     DisplayHelperExited,   // The helper went away on its own
     DisplayStopped,
     DisplayFound,          // Our display is on the desktop
-    DisplayFoundExternal,  // BrowserMon exists but we do not own it
+    DisplayFoundExternal,  // LaptopMon exists but we do not own it
     DisplayNotFound,       // detail: SelectionProblem description
     DisplayLost,
     EngineStarted,
@@ -77,7 +77,7 @@ struct Event {
     std::string detail;
 };
 enum class EffectType {
-    FindDisplay,       // Query the desktop for BrowserMon now
+    FindDisplay,       // Query the desktop for LaptopMon now
     StartDisplay,      // Run the elevated helper
     StopDisplay,       // Ask the helper to remove the device
     StartEngine,
@@ -99,4 +99,4 @@ const char *viewerText(ViewerStatus);
 const char *signalingText(SignalingStatus);
 const char *eventName(EventType);
 const char *effectName(EffectType);
-} // namespace bm
+} // namespace lm

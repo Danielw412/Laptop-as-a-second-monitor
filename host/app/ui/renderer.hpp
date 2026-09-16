@@ -8,7 +8,7 @@
 #include <string_view>
 #include <windows.h>
 #include <wrl/client.h>
-namespace bm::app::ui {
+namespace lm::app::ui {
 using Microsoft::WRL::ComPtr;
 inline D2D1_COLOR_F rgb(uint32_t hex, float alpha = 1.f) {
     return D2D1::ColorF(((hex >> 16) & 255) / 255.f, ((hex >> 8) & 255) / 255.f, (hex & 255) / 255.f, alpha);
@@ -83,4 +83,4 @@ class Renderer {
     ID2D1SolidColorBrush *brush(D2D1_COLOR_F);
     void pickFamilies();
 };
-} // namespace bm::app::ui
+} // namespace lm::app::ui

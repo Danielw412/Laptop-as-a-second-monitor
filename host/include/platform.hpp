@@ -17,12 +17,22 @@
 #include <vector>
 #include <windows.h>
 #include <wrl/client.h>
-namespace bm {
+namespace lm {
 using Microsoft::WRL::ComPtr;
 using Clock = std::chrono::steady_clock;
 inline int64_t now100ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count() /
            100;
+}
+/// QueryPerformanceCounter ticks (what DXGI and WGC stamp frames with) in the same 100 ns units as now100ns().
+/// MSVC's steady_clock is QPC-based, so the two are directly comparable.
+inline int64_t qpcTo100ns(int64_t ticks) {
+    static const int64_t frequency = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart ? f.QuadPart : 1;
+    }();
+    return int64_t((double(ticks) * 10000000.0) / double(frequency));
 }
 inline void check(HRESULT hr, const char *op) {
     if (FAILED(hr)) {
@@ -56,14 +66,19 @@ struct Device {
 };
 struct Frame {
     ComPtr<ID3D11Texture2D> texture;
-    int64_t timestamp{};
+    int64_t timestamp{};  // When the pipeline took the frame (now100ns)
+    int64_t presented{};  // When the compositor produced it (100 ns, same clock); 0 if unknown
     uint32_t accumulated = 1;
 };
 class ICapture {
   public:
     virtual ~ICapture() = default;
-    virtual std::optional<Frame> acquire() = 0;
+    /// Returns the newest frame, waiting up to timeoutMs for one to arrive. It stays valid until release() or the
+    /// next acquire(). Frames skipped to reach the newest one are counted in Frame::accumulated.
+    virtual std::optional<Frame> acquire(unsigned timeoutMs) = 0;
     virtual void release() = 0;
+    /// Signalled when a frame arrives, or null when the backend can only wait inside acquire() (DXGI).
+    virtual HANDLE frameEvent() const = 0;
 };
 std::unique_ptr<ICapture> duplication(Device &, const Display &);
 std::unique_ptr<ICapture> wgc(Device &, const Display &);
@@ -74,8 +89,10 @@ class Converter {
     ComPtr<ID3D11VideoProcessorEnumerator> enumerator_;
     ComPtr<ID3D11VideoProcessor> processor_;
     unsigned width_, height_;
-    std::array<ComPtr<ID3D11Texture2D>, 3> textures_;
-    std::array<ComPtr<ID3D11VideoProcessorOutputView>, 3> views_;
+    // Output ring: one more surface than the encoder may hold, so a conversion never waits for the encoder.
+    static constexpr size_t kSlots = 4;
+    std::array<ComPtr<ID3D11Texture2D>, kSlots> textures_;
+    std::array<ComPtr<ID3D11VideoProcessorOutputView>, kSlots> views_;
     struct InputView {
         ComPtr<ID3D11Texture2D> texture;
         ComPtr<ID3D11VideoProcessorInputView> view;
@@ -96,6 +113,9 @@ class Converter {
     ID3D11Texture2D *texture(size_t slot) {
         return textures_.at(slot).Get();
     }
+    static constexpr size_t slots() {
+        return kSlots;
+    }
     const Samples<> &gpuTimes() const {
         return gpuTimes_;
     }
@@ -103,20 +123,27 @@ class Converter {
 struct Encoded {
     std::vector<uint8_t> bytes;
     int64_t timestamp{};
+    int64_t presented{}; // Source presentation time carried through the encoder (0 if unknown)
     bool keyframe{};
     double latencyMs{};
 };
 class IEncoder {
   public:
     virtual ~IEncoder() = default;
+    /// True when the encoder can take another frame right now.
     virtual bool ready() = 0;
-    virtual bool submit(ID3D11Texture2D *, int64_t) = 0;
+    /// True while the encoder still reads this input surface; writing to it would corrupt a frame in flight.
+    virtual bool holds(ID3D11Texture2D *) const = 0;
+    virtual bool submit(ID3D11Texture2D *, int64_t timestamp, int64_t presented = 0) = 0;
     virtual std::vector<Encoded> poll() = 0;
     virtual void keyframe() = 0;
     virtual bool bitrate(uint32_t) = 0;
     virtual const std::string &name() const = 0;
     virtual size_t pending() const = 0;
+    /// Signalled whenever the encoder has news: output ready, input wanted, or an input surface released.
+    virtual HANDLE event() const = 0;
 };
+/// maxInFlight bounds how many frames may be inside the encoder at once (queue depth, and so added latency).
 std::unique_ptr<IEncoder> hardwareEncoder(Device &, const Display &, unsigned width, unsigned height,
-                                          unsigned fps, uint32_t bitrate = 8000000);
-} // namespace bm
+                                          unsigned fps, uint32_t bitrate = 8000000, unsigned maxInFlight = 2);
+} // namespace lm

@@ -1,7 +1,7 @@
 #include "display_identity.hpp"
 #include <algorithm>
 #include <cctype>
-namespace bm {
+namespace lm {
 namespace {
 std::string upper(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return char(std::toupper(c)); });
@@ -11,21 +11,21 @@ uint16_t swapped(uint16_t v) {
     return uint16_t((v << 8) | (v >> 8));
 }
 } // namespace
-bool isBrowserMon(const DisplayTarget &t) {
+bool isLaptopMon(const DisplayTarget &t) {
     // The PnP hardware id in the device path is derived from the EDID manufacturer and product and is the most
     // reliable marker. DISPLAYCONFIG reports the manufacturer word in either byte order depending on the API, so
     // accept both. The friendly name alone is accepted too: it also comes straight from the EDID.
-    if (upper(t.devicePath).find(std::string("DISPLAY#") + kBrowserMonPnpId + "#") != std::string::npos)
+    if (upper(t.devicePath).find(std::string("DISPLAY#") + kLaptopMonPnpId + "#") != std::string::npos)
         return true;
-    if ((t.edidManufacturer == kBrowserMonManufacturer || t.edidManufacturer == swapped(kBrowserMonManufacturer)) &&
-        t.edidProduct == kBrowserMonProduct)
+    if ((t.edidManufacturer == kLaptopMonManufacturer || t.edidManufacturer == swapped(kLaptopMonManufacturer)) &&
+        t.edidProduct == kLaptopMonProduct)
         return true;
-    return t.friendlyName == kBrowserMonFriendlyName;
+    return t.friendlyName == kLaptopMonFriendlyName;
 }
-Selection selectBrowserMon(const std::vector<DisplayTarget> &targets) {
+Selection selectLaptopMon(const std::vector<DisplayTarget> &targets) {
     Selection best;
     for (const auto &t : targets) {
-        if (!isBrowserMon(t) || !t.available)
+        if (!isLaptopMon(t) || !t.available)
             continue;
         SelectionProblem problem = SelectionProblem::None;
         if (!t.active || t.gdiName.empty())
@@ -45,16 +45,16 @@ Selection selectBrowserMon(const std::vector<DisplayTarget> &targets) {
 const char *describe(SelectionProblem p) {
     switch (p) {
     case SelectionProblem::None:
-        return "BrowserMon found";
+        return "LaptopMon found";
     case SelectionProblem::NotFound:
-        return "BrowserMon is not connected";
+        return "LaptopMon is not connected";
     case SelectionProblem::Inactive:
-        return "BrowserMon is attached but not part of the desktop";
+        return "LaptopMon is attached but not part of the desktop";
     case SelectionProblem::Cloned:
-        return "BrowserMon is duplicating another display";
+        return "LaptopMon is duplicating another display";
     case SelectionProblem::Primary:
-        return "BrowserMon is set as the primary display; streaming refused";
+        return "LaptopMon is set as the primary display; streaming refused";
     }
     return "Unknown display state";
 }
-} // namespace bm
+} // namespace lm

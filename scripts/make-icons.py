@@ -45,7 +45,7 @@ def main() -> None:
     ROOT.mkdir(parents=True, exist_ok=True)
     for suffix, dot in DOTS.items():
         frames = [frame(size, dot) for size in SIZES]
-        path = ROOT / f"BrowserMonitor{suffix}.ico"
+        path = ROOT / f"LaptopMonitor{suffix}.ico"
         frames[-1].save(path, format="ICO", sizes=[(s, s) for s in SIZES], append_images=frames[:-1])
         print("wrote", path)
 

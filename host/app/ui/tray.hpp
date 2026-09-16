@@ -2,7 +2,7 @@
 #include <string>
 #include <windows.h>
 #include <shellapi.h>
-namespace bm::app::ui {
+namespace lm::app::ui {
 class TrayIcon {
   public:
     void add(HWND owner, UINT callbackMessage, HICON icon, const wchar_t *tip);
@@ -17,4 +17,4 @@ class TrayIcon {
     NOTIFYICONDATAW data_{};
     bool added_ = false;
 };
-} // namespace bm::app::ui
+} // namespace lm::app::ui

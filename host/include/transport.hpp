@@ -7,7 +7,7 @@
 #include "settings.hpp"
 #include <functional>
 #include <nlohmann/json.hpp>
-namespace bm {
+namespace lm {
 enum class SignalingState { Disconnected, Connecting, Connected, Rejected };
 enum class TransportEventType {
     SignalingConnecting,
@@ -41,6 +41,8 @@ class ITransport {
     virtual void rotateCode() = 0;
     virtual PairingSnapshot pairing() const = 0;
     virtual void fillMetrics(MetricsSnapshot &) const = 0;
+    /// Signalled when a signaling message, telemetry or a keyframe request arrives; lets the engine sleep on it.
+    virtual HANDLE wakeEvent() const = 0;
 };
 struct TransportTestOptions {
     unsigned dropEvery = 0;
@@ -49,4 +51,4 @@ struct TransportTestOptions {
 std::unique_ptr<ITransport> webRtc(std::string server, std::string hostSecret,
                                    std::function<void(const TransportEvent &)> events = {},
                                    TransportTestOptions test = {}, BitratePlan plan = bitratePlan(QualityPreset::Balanced));
-} // namespace bm
+} // namespace lm

@@ -9,7 +9,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-namespace bm {
+namespace lm {
 inline constexpr std::string_view kCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 inline constexpr size_t kCodeLength = 6;
 struct CodeRegistration {
@@ -62,4 +62,4 @@ class PairingCodes {
     std::optional<Entry> previous_;
     uint64_t generation_ = 0;
 };
-} // namespace bm
+} // namespace lm

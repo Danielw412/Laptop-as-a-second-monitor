@@ -33,5 +33,5 @@ if (!$SkipDependencies) {
 Invoke-Checked cmake @('-S','.','-B','build/host','-G','Ninja','-DCMAKE_BUILD_TYPE=Release',"-DCMAKE_PREFIX_PATH=$projectRoot/.deps/install")
 Invoke-Checked cmake @('--build','build/host','-j',"$Jobs")
 Invoke-Checked ctest @('--test-dir','build/host','--output-on-failure')
-Write-Host "Built $projectRoot/build/host/BrowserMonitor.exe (app), BrowserMonitorDisplay.exe (elevated helper) and browser-monitor-bench.exe"
-Write-Host 'Next: run BrowserMonitor.exe and click "Set up..." once (one administrator approval). See README.md.'
+Write-Host "Built $projectRoot/build/host/LaptopMonitor.exe (app), LaptopMonitorDisplay.exe (elevated helper) and laptop-monitor-bench.exe"
+Write-Host 'Next: run LaptopMonitor.exe and click "Set up..." once (one administrator approval). See README.md.'

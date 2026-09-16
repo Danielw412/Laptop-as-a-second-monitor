@@ -1,6 +1,6 @@
 #include "ui/tray.hpp"
 #include <cstring>
-namespace bm::app::ui {
+namespace lm::app::ui {
 void TrayIcon::add(HWND owner, UINT callbackMessage, HICON icon, const wchar_t *tip) {
     if (added_)
         remove();
@@ -43,4 +43,4 @@ void TrayIcon::remove() {
         added_ = false;
     }
 }
-} // namespace bm::app::ui
+} // namespace lm::app::ui

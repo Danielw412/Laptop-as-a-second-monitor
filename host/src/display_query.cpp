@@ -2,7 +2,7 @@
 #include "logging.hpp"
 #include <map>
 #include <tuple>
-namespace bm {
+namespace lm {
 namespace {
 using TargetKey = std::tuple<LONG, DWORD, UINT32>;
 TargetKey key(const DISPLAYCONFIG_PATH_TARGET_INFO &t) {
@@ -12,7 +12,7 @@ TargetKey key(const DISPLAYCONFIG_PATH_TARGET_INFO &t) {
 std::vector<DisplayTarget> queryDisplayTargets() {
     std::vector<DisplayTarget> result;
     UINT32 pathCount = 0, modeCount = 0;
-    // QDC_ALL_PATHS lists inactive targets too, which is how we notice BrowserMon attached but not extended.
+    // QDC_ALL_PATHS lists inactive targets too, which is how we notice LaptopMon attached but not extended.
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
             return result;
@@ -60,6 +60,10 @@ std::vector<DisplayTarget> queryDisplayTargets() {
                                  p.sourceInfo.id};
                 if (DisplayConfigGetDeviceInfo(&source.header) == ERROR_SUCCESS)
                     t.gdiName = utf8(source.viewGdiDeviceName);
+                t.hasSource = true;
+                t.sourceAdapterId = (int64_t(p.sourceInfo.adapterId.HighPart) << 32) |
+                                    int64_t(uint32_t(p.sourceInfo.adapterId.LowPart));
+                t.sourceId = p.sourceInfo.id;
                 const UINT32 modeIndex = p.sourceInfo.modeInfoIdx;
                 if (modeIndex != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && modeIndex < modes.size() &&
                     modes[modeIndex].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
@@ -98,21 +102,22 @@ DisplayMatch resolve(const std::string &gdiName, bool allowPrimary) {
         return match;
     }
     match.problem = SelectionProblem::Inactive;
-    match.detail = "BrowserMon is not attached to the desktop as a capturable output yet";
+    match.detail = "LaptopMon is not attached to the desktop as a capturable output yet";
     return match;
 }
 } // namespace
-DisplayMatch matchBrowserMon(bool allowPrimary) {
-    auto selection = selectBrowserMon(queryDisplayTargets());
+DisplayMatch matchLaptopMon(bool allowPrimary) {
+    auto selection = selectLaptopMon(queryDisplayTargets());
     DisplayMatch match;
     match.problem = selection.problem;
     match.detail = describe(selection.problem);
+    match.target = selection.display; // Carried even on the failure paths, for diagnostics
     if (!selection.display)
         return match;
     if (selection.problem == SelectionProblem::Primary && !allowPrimary)
         return match;
     if (selection.problem == SelectionProblem::Inactive || selection.problem == SelectionProblem::Cloned) {
-        // Windows attached BrowserMon in Duplicate mode or left it inactive. Extend the desktop once; the caller
+        // Windows attached LaptopMon in Duplicate mode or left it inactive. Extend the desktop once; the caller
         // polls again after the topology change.
         static Clock::time_point lastFix{};
         if (Clock::now() - lastFix > std::chrono::seconds(10)) {
@@ -122,7 +127,9 @@ DisplayMatch matchBrowserMon(bool allowPrimary) {
         }
         return match;
     }
-    return resolve(selection.display->gdiName, allowPrimary);
+    auto resolved = resolve(selection.display->gdiName, allowPrimary);
+    resolved.target = selection.display;
+    return resolved;
 }
 DisplayMatch matchNamedDisplay(const std::string &gdiName, bool allowPrimary) {
     auto match = resolve(gdiName, allowPrimary);
@@ -132,4 +139,4 @@ DisplayMatch matchNamedDisplay(const std::string &gdiName, bool allowPrimary) {
     }
     return match;
 }
-} // namespace bm
+} // namespace lm

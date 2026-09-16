@@ -22,5 +22,5 @@ if ((Get-AuthenticodeSignature $nuget).Status -ne 'Valid') { throw "$nuget does 
 Invoke-Checked $nuget @('restore', 'driver/packages.config', '-PackagesDirectory', '.deps/packages', '-NonInteractive')
 # SignMode=Off: the WDK's auto-generated test certificate needs elevation. The catalog is still produced by Inf2Cat
 # and is signed at install time by scripts/install-driver.ps1.
-Invoke-Checked msbuild @('driver/BrowserMonitorIdd.sln', '-t:rebuild', '-m', '-nologo', '-warnaserror', '-clp:Verbosity=m', "-p:Configuration=$Configuration", '-p:Platform=x64', '-p:TargetVersion=Windows10', '-p:SignMode=Off')
-Write-Host "Built driver package $projectRoot/driver/x64/$Configuration/BrowserMonitorIdd and driver/x64/$Configuration/BrowserMonitorIddApp.exe"
+Invoke-Checked msbuild @('driver/LaptopMonitorIdd.sln', '-t:rebuild', '-m', '-nologo', '-warnaserror', '-clp:Verbosity=m', "-p:Configuration=$Configuration", '-p:Platform=x64', '-p:TargetVersion=Windows10', '-p:SignMode=Off')
+Write-Host "Built driver package $projectRoot/driver/x64/$Configuration/LaptopMonitorIdd and driver/x64/$Configuration/LaptopMonitorIddApp.exe"

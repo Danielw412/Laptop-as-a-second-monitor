@@ -1,12 +1,13 @@
 #pragma once
 // User settings (plain JSON) and the host credential (DPAPI). Settings are deliberately few: the things a daily user
 // might change. Internal tuning stays in code.
+#include "display_scale.hpp"
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include <string>
-namespace bm {
-inline constexpr const char *kDefaultSignalingUrl = BM_DEFAULT_SIGNALING_URL;
-inline constexpr const char *kViewerUrl = BM_VIEWER_URL;
+namespace lm {
+inline constexpr const char *kDefaultSignalingUrl = LM_DEFAULT_SIGNALING_URL;
+inline constexpr const char *kViewerUrl = LM_VIEWER_URL;
 enum class CaptureBackend { Auto, Wgc, Dxgi };
 enum class QualityPreset { Efficient, Balanced, Quality };
 struct Settings {
@@ -17,6 +18,9 @@ struct Settings {
     CaptureBackend backend = CaptureBackend::Auto;
     unsigned fps = 60;
     QualityPreset quality = QualityPreset::Balanced;
+    // Windows scaling for the virtual display only. 150% matches the 13.3" panel its EDID describes, which is
+    // what makes text and UI on a small receiver laptop readable without dropping the streamed resolution.
+    DisplayScale displayScale = DisplayScale::Percent150;
     std::string signalingUrl = kDefaultSignalingUrl;
     bool operator==(const Settings &) const = default;
 };
@@ -44,7 +48,7 @@ class SettingsStore {
     void save(const Settings &) const;
 };
 #ifdef _WIN32
-std::filesystem::path appDataDirectory(); // %LOCALAPPDATA%\BrowserMonitor
+std::filesystem::path appDataDirectory(); // %LOCALAPPDATA%\LaptopMonitor
 std::filesystem::path settingsPath();
 std::filesystem::path credentialPath();
 std::filesystem::path logDirectory();
@@ -54,4 +58,4 @@ std::string loadOrCreateHostSecret(const std::filesystem::path &);
 /// Room id for a credential: first 32 hex characters of SHA-256 over the credential text.
 std::string roomIdFor(const std::string &secret);
 bool validSecret(const std::string &secret);
-} // namespace bm
+} // namespace lm

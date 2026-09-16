@@ -10,7 +10,7 @@
 #include <thread>
 #include <winrt/base.h>
 #include <shellapi.h>
-namespace bm {
+namespace lm {
 std::atomic<bool> running = true;
 NOTIFYICONDATAW tray{};
 BOOL WINAPI control(DWORD) {
@@ -40,7 +40,7 @@ LRESULT CALLBACK pairingProc(HWND window, UINT message, WPARAM w, LPARAM l) {
         if (l == WM_RBUTTONUP) {
             auto menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, 1, L"Show pairing");
-            AppendMenuW(menu, MF_STRING, 2, L"Exit Browser Monitor");
+            AppendMenuW(menu, MF_STRING, 2, L"Exit Laptop Monitor");
             POINT point; GetCursorPos(&point); SetForegroundWindow(window);
             auto command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
             DestroyMenu(menu);
@@ -60,11 +60,11 @@ void pairingWindow(const std::string &room, const std::string &secret, bool back
     WNDCLASSW wc{};
     wc.lpfnWndProc = pairingProc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"BrowserMonitorPairing";
+    wc.lpszClassName = L"LaptopMonitorPairing";
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
     auto window =
-        CreateWindowExW(0, wc.lpszClassName, L"Browser Monitor — pairing", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+        CreateWindowExW(0, wc.lpszClassName, L"Laptop Monitor — pairing", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                         CW_USEDEFAULT, 720, 230, nullptr, nullptr, wc.hInstance, nullptr);
     std::string text = "Room: " + room + "\r\n\r\nSession secret (select and copy into the receiver):\r\n" +
                        secret +
@@ -76,7 +76,7 @@ void pairingWindow(const std::string &room, const std::string &secret, bool back
     tray.cbSize = sizeof(tray); tray.hWnd = window; tray.uID = 1;
     tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; tray.uCallbackMessage = WM_APP + 1;
     tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy_s(tray.szTip, L"Browser Monitor — right-click for pairing or exit");
+    wcscpy_s(tray.szTip, L"Laptop Monitor — right-click for pairing or exit");
     Shell_NotifyIconW(NIM_ADD, &tray);
     ShowWindow(window, background ? SW_HIDE : SW_SHOW);
 }
@@ -511,13 +511,13 @@ int run(int argc, char **argv) {
     MFShutdown();
     return 0;
 }
-} // namespace bm
+} // namespace lm
 int main(int argc, char **argv) {
     try {
-        return bm::run(argc, argv);
+        return lm::run(argc, argv);
     } catch (const std::exception &e) {
-        std::cerr << "Browser Monitor: " << e.what()
-                  << "\nUsage: browser-monitor --list\n  --display \\\\.\\DISPLAY2 --signaling "
+        std::cerr << "Laptop Monitor: " << e.what()
+                  << "\nUsage: laptop-monitor --list\n  --display \\\\.\\DISPLAY2 --signaling "
                      "https://worker.workers.dev\n  --mode capture|convert|encode|capture-encode|stream "
                      "--capture dxgi|wgc --fps 60 --seconds 30 --csv results.csv\n";
         return 1;

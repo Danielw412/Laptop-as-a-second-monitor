@@ -2,18 +2,18 @@
 // Shared declarations for the desktop application: window messages, timers and small helpers.
 #include "platform.hpp"
 #include <string>
-namespace bm::app {
+namespace lm::app {
 inline constexpr UINT WM_APP_EVENT = WM_APP + 1;    // Controller event queue has entries (any thread -> UI)
 inline constexpr UINT WM_APP_TRAY = WM_APP + 2;     // Shell_NotifyIcon callback
 inline constexpr UINT WM_APP_ACTIVATE = WM_APP + 3; // A second instance asked us to come forward
 inline constexpr UINT WM_APP_SETUP_DONE = WM_APP + 4; // Elevated setup/uninstall process finished; wParam = exit code
 inline constexpr UINT_PTR TIMER_UI = 1;             // Metrics/countdown repaint
-inline constexpr UINT_PTR TIMER_FIND = 2;           // Poll for BrowserMon while the display starts
+inline constexpr UINT_PTR TIMER_FIND = 2;           // Poll for LaptopMon while the display starts
 inline constexpr UINT_PTR TIMER_TOAST = 3;          // Clear transient "Copied" feedback
-inline constexpr const wchar_t *kWindowClass = L"BrowserMonitorMain";
-inline constexpr const wchar_t *kInstanceMutex = L"Local\\BrowserMonitor.App.Instance";
-inline constexpr const wchar_t *kTaskName = L"Browser Monitor Display";
-inline constexpr const wchar_t *kRunValue = L"BrowserMonitor";
+inline constexpr const wchar_t *kWindowClass = L"LaptopMonitorMain";
+inline constexpr const wchar_t *kInstanceMutex = L"Local\\LaptopMonitor.App.Instance";
+inline constexpr const wchar_t *kTaskName = L"Laptop Monitor Display";
+inline constexpr const wchar_t *kRunValue = L"LaptopMonitor";
 inline std::wstring widen(std::string_view s) {
     if (s.empty())
         return {};
@@ -42,4 +42,4 @@ inline std::wstring lastErrorText(DWORD error = GetLastError()) {
     return text;
 }
 std::wstring modulePath();
-} // namespace bm::app
+} // namespace lm::app

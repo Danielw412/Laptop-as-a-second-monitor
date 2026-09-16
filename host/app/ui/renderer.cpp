@@ -1,6 +1,6 @@
 #include "ui/renderer.hpp"
 #include <algorithm>
-namespace bm::app::ui {
+namespace lm::app::ui {
 namespace {
 struct FontSpec {
     const wchar_t *familyKind; // "text", "display" or "mono"
@@ -180,4 +180,4 @@ D2D1_SIZE_F Renderer::measure(std::wstring_view s, Font f, float maxWidth) {
     layout->GetMetrics(&metrics);
     return D2D1::SizeF(metrics.widthIncludingTrailingWhitespace, metrics.height);
 }
-} // namespace bm::app::ui
+} // namespace lm::app::ui

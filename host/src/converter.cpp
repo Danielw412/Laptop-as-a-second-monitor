@@ -1,5 +1,5 @@
 #include "platform.hpp"
-namespace bm {
+namespace lm {
 Converter::Converter(Device &d, unsigned iw, unsigned ih, unsigned ow, unsigned oh)
     : device_(d), width_(ow), height_(oh) {
     check(d.device.As(&video_), "D3D11 video device");
@@ -102,4 +102,4 @@ ID3D11Texture2D *Converter::convert(ID3D11Texture2D *input, size_t slot) {
     }
     return textures_.at(slot).Get();
 }
-} // namespace bm
+} // namespace lm

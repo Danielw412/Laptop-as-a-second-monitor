@@ -1,16 +1,16 @@
-// Browser Monitor desktop application entry point.
-//   BrowserMonitor.exe                start (or bring the running instance forward)
-//   BrowserMonitor.exe --background   start hidden in the tray (used by "start at sign-in")
-//   BrowserMonitor.exe --setup        elevated one-time setup (launched by the app through UAC)
-//   BrowserMonitor.exe --uninstall    elevated removal of everything setup created
+// Laptop Monitor desktop application entry point.
+//   LaptopMonitor.exe                start (or bring the running instance forward)
+//   LaptopMonitor.exe --background   start hidden in the tray (used by "start at sign-in")
+//   LaptopMonitor.exe --setup        elevated one-time setup (launched by the app through UAC)
+//   LaptopMonitor.exe --uninstall    elevated removal of everything setup created
 #include "app.hpp"
 #include "logging.hpp"
 #include "settings.hpp"
 #include "setup.hpp"
 #include "ui/main_window.hpp"
 #include <shellapi.h>
-using namespace bm;
-using namespace bm::app;
+using namespace lm;
+using namespace lm::app;
 namespace {
 void activateExisting() {
     HWND existing = FindWindowW(kWindowClass, nullptr);
@@ -57,17 +57,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         Settings settings = store.load();
         if (settings.diagnosticsLog)
             Log::instance().openFile(logDirectory());
-        logInfo("Browser Monitor " BM_VERSION " starting");
+        logInfo("Laptop Monitor " LM_VERSION " starting");
         // Keep the registry in step with the setting in case the executable moved.
         if (settings.startAtSignIn)
             setStartAtSignIn(true);
         std::string secret = loadOrCreateHostSecret(credentialPath());
         ui::MainWindow window(instance, background, std::move(store), std::move(settings), std::move(secret));
         code = window.run();
-        logInfo("Browser Monitor exited");
+        logInfo("Laptop Monitor exited");
     } catch (const std::exception &e) {
         logError(std::string("Fatal: ") + e.what());
-        MessageBoxW(nullptr, (L"Browser Monitor could not start:\n\n" + widen(e.what())).c_str(), L"Browser Monitor",
+        MessageBoxW(nullptr, (L"Laptop Monitor could not start:\n\n" + widen(e.what())).c_str(), L"Laptop Monitor",
                     MB_ICONERROR | MB_OK);
     }
     if (SUCCEEDED(com))

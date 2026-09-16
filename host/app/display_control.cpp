@@ -4,16 +4,44 @@
 #include "setup.hpp"
 #include "sha256.hpp"
 #include <bcrypt.h>
-namespace bm::app {
+namespace lm::app {
 namespace {
+constexpr DWORD kPipeConnectMs = 25000; // The task engine has to launch the helper first
+constexpr DWORD kReadyMs = 20000;       // ...and the helper then has to create the device
+constexpr DWORD kWriteMs = 3000;        // A command the helper is not reading means the helper is gone
+constexpr DWORD kPollMs = 200;          // How often the watch loop re-checks its deadlines
+constexpr DWORD kStopConfirmMs = 8000;  // Report the stop anyway if the helper never confirms it
+constexpr DWORD kExitWaitMs = 5000;     // Let the helper finish removing the device before we report
 std::wstring randomNonce() {
     uint8_t bytes[16];
     if (BCryptGenRandom(nullptr, bytes, sizeof bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
         throw std::runtime_error("Secure random generator unavailable");
     return widen(hexLower(bytes, sizeof bytes));
 }
-/// Reads one line from the pipe, waiting up to `timeoutMs`. Returns false on timeout or disconnect.
-bool readLine(HANDLE pipe, std::string &buffer, std::string &line, DWORD timeoutMs) {
+/// One overlapped read: >0 bytes read, 0 nothing arrived within `timeoutMs` (or `wake` fired), -1 the pipe is
+/// gone. A read this cancels is always collected before returning, so `chunk` is free again on every path.
+int readChunk(HANDLE pipe, HANDLE event, HANDLE wake, char *chunk, DWORD size, DWORD timeoutMs) {
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event;
+    ResetEvent(event);
+    DWORD got = 0;
+    bool cancelled = false;
+    if (!ReadFile(pipe, chunk, size, &got, &overlapped)) {
+        if (GetLastError() != ERROR_IO_PENDING)
+            return -1;
+        HANDLE waits[] = {event, wake};
+        if (WaitForMultipleObjects(wake ? 2 : 1, waits, FALSE, timeoutMs) != WAIT_OBJECT_0) {
+            CancelIoEx(pipe, &overlapped);
+            cancelled = true;
+        }
+    }
+    if (!GetOverlappedResult(pipe, &overlapped, &got, TRUE))
+        return cancelled && GetLastError() == ERROR_OPERATION_ABORTED ? 0 : -1;
+    // The read may have completed in the gap before the cancel took effect; those bytes are still ours.
+    return got ? int(got) : -1;
+}
+/// Reads one line, waiting up to `timeoutMs` in total. Returns false on timeout or disconnect.
+bool readLine(HANDLE pipe, HANDLE event, std::string &buffer, std::string &line, DWORD timeoutMs) {
     const auto deadline = GetTickCount64() + timeoutMs;
     for (;;) {
         auto newline = buffer.find('\n');
@@ -22,28 +50,37 @@ bool readLine(HANDLE pipe, std::string &buffer, std::string &line, DWORD timeout
             buffer.erase(0, newline + 1);
             return true;
         }
-        DWORD available = 0;
-        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr))
+        const auto now = GetTickCount64();
+        if (now >= deadline)
             return false;
-        if (!available) {
-            if (GetTickCount64() >= deadline)
-                return false;
-            Sleep(20);
-            continue;
-        }
         char chunk[256];
-        DWORD got = 0;
-        if (!ReadFile(pipe, chunk, DWORD(std::min<DWORD>(available, sizeof chunk)), &got, nullptr) || !got)
+        int got = readChunk(pipe, event, nullptr, chunk, sizeof chunk, DWORD(deadline - now));
+        if (got < 0)
             return false;
-        buffer.append(chunk, got);
+        buffer.append(chunk, size_t(got));
     }
 }
 } // namespace
-DisplayController::DisplayController(std::function<void(Event)> post) : post_(std::move(post)) {}
+DisplayController::DisplayController(std::function<void(Event)> post) : post_(std::move(post)) {
+    wake_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+}
 DisplayController::~DisplayController() {
+    shutdown();
+    closeHandles();
+    if (wake_)
+        CloseHandle(wake_);
+}
+void DisplayController::shutdown() {
     abandon();
+    quiet_ = true; // Anything the worker still has to say would arrive after our owner stopped listening
+    if (wake_)
+        SetEvent(wake_);
     if (worker_.joinable())
         worker_.join();
+}
+void DisplayController::report(Event e) {
+    if (!quiet_ && post_)
+        post_(std::move(e));
 }
 void DisplayController::closeHandles() {
     std::lock_guard lock(mutex_);
@@ -60,43 +97,70 @@ bool DisplayController::writeCommand(const char *command) {
     std::lock_guard lock(mutex_);
     if (!pipe_)
         return false;
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event)
+        return false;
+    // `line` backs the overlapped buffer, so every path below collects the write before it goes out of scope.
     std::string line = std::string(command) + "\n";
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event;
     DWORD written = 0;
-    return WriteFile(pipe_, line.data(), DWORD(line.size()), &written, nullptr) && written == line.size();
+    bool started = WriteFile(pipe_, line.data(), DWORD(line.size()), &written, &overlapped) != 0;
+    if (!started && GetLastError() != ERROR_IO_PENDING) {
+        CloseHandle(event);
+        return false;
+    }
+    if (!started && WaitForSingleObject(event, kWriteMs) != WAIT_OBJECT_0)
+        CancelIoEx(pipe_, &overlapped);
+    const bool ok = GetOverlappedResult(pipe_, &overlapped, &written, TRUE) != 0;
+    CloseHandle(event);
+    return ok && written == line.size();
 }
 void DisplayController::start() {
-    if (generationBusy_.exchange(true)) {
+    if (busy_.exchange(true)) {
         logWarning("Display helper start ignored: an operation is already in progress");
         return;
     }
-    if (worker_.joinable())
+    if (worker_.joinable()) {
+        // A helper from an earlier generation may still be connected: take it down before replacing it, so the
+        // join below is bounded and we never leave a second virtual display behind.
+        if (owned_) {
+            stopping_ = true;
+            writeCommand("stop");
+        }
+        SetEvent(wake_);
         worker_.join();
+        ResetEvent(wake_);
+    }
     stopping_ = false;
     const auto generation = ++generation_;
     worker_ = std::thread([this, generation] { serve(generation); });
 }
 void DisplayController::serve(uint64_t generation) {
+    auto giveUp = [&](std::string reason) {
+        busy_ = false;
+        report({EventType::DisplayStartFailed, std::move(reason)});
+    };
     std::wstring nonce;
     try {
         nonce = randomNonce();
     } catch (const std::exception &e) {
-        generationBusy_ = false;
-        post_({EventType::DisplayStartFailed, e.what()});
+        giveUp(e.what());
         return;
     }
     std::wstring argument = std::to_wstring(GetCurrentProcessId()) + L":" + nonce;
     std::wstring error;
     if (!runDisplayTask(argument, error)) {
-        generationBusy_ = false;
-        post_({EventType::DisplayStartFailed, narrow(error)});
+        giveUp(narrow(error));
         return;
     }
     // The helper creates the pipe once the task engine has launched it; that takes a moment.
-    std::wstring pipeName = L"\\\\.\\pipe\\BrowserMonitor.Display." + nonce;
+    std::wstring pipeName = L"\\\\.\\pipe\\LaptopMonitor.Display." + nonce;
     HANDLE pipe = INVALID_HANDLE_VALUE;
-    const auto deadline = GetTickCount64() + 25000;
-    while (GetTickCount64() < deadline) {
-        pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    const auto deadline = GetTickCount64() + kPipeConnectMs;
+    while (GetTickCount64() < deadline && WaitForSingleObject(wake_, 0) != WAIT_OBJECT_0) {
+        pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OVERLAPPED, nullptr);
         if (pipe != INVALID_HANDLE_VALUE)
             break;
         DWORD code = GetLastError();
@@ -106,11 +170,23 @@ void DisplayController::serve(uint64_t generation) {
             Sleep(100);
     }
     if (pipe == INVALID_HANDLE_VALUE) {
-        generationBusy_ = false;
-        post_({EventType::DisplayStartFailed, "The display helper did not start. Windows may have blocked the task, "
-                                              "or setup needs to be repeated."});
+        giveUp("The display helper did not start. Windows may have blocked the task, or setup needs to be "
+               "repeated.");
         return;
     }
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event) {
+        CloseHandle(pipe);
+        giveUp("Could not create the event the display helper pipe needs.");
+        return;
+    }
+    auto abandonStart = [&](HANDLE helper, std::string reason) {
+        if (helper)
+            CloseHandle(helper);
+        CloseHandle(event);
+        CloseHandle(pipe);
+        giveUp(std::move(reason));
+    };
     // Verify the pipe really belongs to our installed helper before trusting anything it says.
     ULONG serverPid = 0;
     HANDLE helper = nullptr;
@@ -123,23 +199,16 @@ void DisplayController::serve(uint64_t generation) {
                 auto expected = installedHelperPath().wstring();
                 if (_wcsicmp(image, expected.c_str()) != 0) {
                     logWarning("Display helper pipe is served by an unexpected image: " + narrow(image));
-                    CloseHandle(helper);
-                    CloseHandle(pipe);
-                    generationBusy_ = false;
-                    post_({EventType::DisplayStartFailed, "The display helper pipe was not served by the installed "
-                                                          "BrowserMonitorDisplay.exe."});
+                    abandonStart(helper, "The display helper pipe was not served by the installed "
+                                         "LaptopMonitorDisplay.exe.");
                     return;
                 }
             }
         }
     }
     std::string buffer, line;
-    if (!readLine(pipe, buffer, line, 20000)) {
-        if (helper)
-            CloseHandle(helper);
-        CloseHandle(pipe);
-        generationBusy_ = false;
-        post_({EventType::DisplayStartFailed, "The display helper did not report its status."});
+    if (!readLine(pipe, event, buffer, line, kReadyMs)) {
+        abandonStart(helper, "The display helper did not report its status.");
         return;
     }
     if (!line.starts_with("ready")) {
@@ -153,11 +222,7 @@ void DisplayController::serve(uint64_t generation) {
             std::snprintf(hex, sizeof hex, "0x%08x", unsigned(std::stoul(code)));
             text += " (" + std::string(hex) + ")";
         }
-        if (helper)
-            CloseHandle(helper);
-        CloseHandle(pipe);
-        generationBusy_ = false;
-        post_({EventType::DisplayStartFailed, text});
+        abandonStart(helper, text);
         return;
     }
     {
@@ -166,16 +231,18 @@ void DisplayController::serve(uint64_t generation) {
         helper_ = helper;
     }
     owned_ = true;
-    generationBusy_ = false;
+    busy_ = false;
     logInfo("Virtual display device created (" + line.substr(6) + ")");
-    post_({EventType::DisplayStarted});
-    // Watch the pipe until the helper leaves. The read blocks; stop() writes on the same pipe from another thread.
-    for (;;) {
+    report({EventType::DisplayStarted});
+    // Watch the pipe until the helper leaves. stop() writes on this same pipe from the UI thread, which is why the
+    // handle is overlapped; the short poll interval is what lets us notice an unconfirmed stop.
+    uint64_t stopDeadline = 0;
+    while (WaitForSingleObject(wake_, 0) != WAIT_OBJECT_0) {
         char chunk[256];
-        DWORD got = 0;
-        if (!ReadFile(pipe, chunk, sizeof chunk, &got, nullptr) || !got)
-            break;
-        buffer.append(chunk, got);
+        int got = readChunk(pipe, event, wake_, chunk, sizeof chunk, kPollMs);
+        if (got < 0)
+            break; // The helper closed the pipe or exited
+        buffer.append(chunk, size_t(got));
         size_t newline;
         while ((newline = buffer.find('\n')) != std::string::npos) {
             line = buffer.substr(0, newline);
@@ -183,42 +250,34 @@ void DisplayController::serve(uint64_t generation) {
             if (line == "stopped")
                 logInfo("Virtual display device removed");
         }
+        if (stopping_ && !stopDeadline)
+            stopDeadline = GetTickCount64() + kStopConfirmMs;
+        if (stopDeadline && GetTickCount64() >= stopDeadline) {
+            // Safety net: the UI must never be left waiting on a helper that stopped answering.
+            logWarning("Display helper did not exit within " + std::to_string(kStopConfirmMs / 1000) +
+                       " s; continuing");
+            break;
+        }
     }
+    CloseHandle(event);
     if (helper)
-        WaitForSingleObject(helper, 5000);
+        WaitForSingleObject(helper, kExitWaitMs); // The device is gone once the process that held it is
     closeHandles();
     owned_ = false;
     if (generation != generation_)
         return; // A newer start superseded this helper; its outcome is reported by the newer serve()
-    post_({stopping_ ? EventType::DisplayStopped : EventType::DisplayHelperExited});
+    report({stopping_ ? EventType::DisplayStopped : EventType::DisplayHelperExited});
 }
 void DisplayController::stop() {
     if (!owned_) {
-        post_({EventType::DisplayStopped});
+        report({EventType::DisplayStopped});
         return;
     }
     stopping_ = true;
-    if (!writeCommand("stop")) {
-        // The pipe is already gone; the watcher will report the exit.
+    // The worker reports DisplayStopped once the helper goes, or after kStopConfirmMs if it never does. Nothing
+    // here waits: this runs on the UI thread.
+    if (!writeCommand("stop"))
         logWarning("Could not send stop to the display helper");
-    }
-    // Safety net: if the helper never confirms, report the stop anyway after 8 s so the UI cannot hang.
-    std::thread([this] {
-        HANDLE helper = nullptr;
-        {
-            std::lock_guard lock(mutex_);
-            if (helper_)
-                DuplicateHandle(GetCurrentProcess(), helper_, GetCurrentProcess(), &helper, 0, FALSE,
-                                DUPLICATE_SAME_ACCESS);
-        }
-        if (helper) {
-            if (WaitForSingleObject(helper, 8000) == WAIT_TIMEOUT && owned_) {
-                logWarning("Display helper did not exit within 8 s; continuing");
-                post_({EventType::DisplayStopped});
-            }
-            CloseHandle(helper);
-        }
-    }).detach();
 }
 void DisplayController::abandon() {
     if (owned_) {
@@ -226,4 +285,4 @@ void DisplayController::abandon() {
         writeCommand("stop");
     }
 }
-} // namespace bm::app
+} // namespace lm::app
