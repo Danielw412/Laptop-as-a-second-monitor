@@ -61,7 +61,7 @@ if(LM_BUILD_HOST)
               host/src/pipeline.cpp)
   target_include_directories(lm-pipeline PUBLIC host/include "${CMAKE_BINARY_DIR}/generated")
   target_link_libraries(lm-pipeline PUBLIC lm-logic datachannel-static d3d11 dxgi mfplat mf mfuuid
-                        wmcodecdspuuid ole32 oleaut32 user32 gdi32 shcore shell32 windowsapp evr)
+                        wmcodecdspuuid ole32 oleaut32 user32 gdi32 shcore shell32 windowsapp evr avrt)
 
   add_executable(laptop-monitor-bench host/bench/main.cpp)
   target_link_libraries(laptop-monitor-bench PRIVATE lm-pipeline)

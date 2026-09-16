@@ -124,4 +124,9 @@ export interface Telemetry {
   fps: number | null;
   dropped: number | null;
   decoded: number | null;
+  /** Receiver-side delays over the last interval (ms per frame); absent on older receivers. */
+  jitterBufferMs?: number | null;
+  decodeMs?: number | null;
+  processingMs?: number | null;
+  freezes?: number | null;
 }

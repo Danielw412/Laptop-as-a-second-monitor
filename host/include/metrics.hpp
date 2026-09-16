@@ -18,7 +18,14 @@ struct MetricsSnapshot {
     double captureMsMean = 0, captureMsP95 = 0;
     double convertSubmitMsMean = 0, gpuSpanMsMean = 0;
     std::optional<double> encodeMsMean, encodeMsP95, encodeMsP99, pipelineMsMean, pipelineMsP95;
-    double frameBytesMean = 0;
+    // Compositor presentation -> pipeline acquisition (how long a finished frame waited for the loop) and
+    // presentation -> encoded output (host-side glass-to-bitstream). Empty when the backend gives no source time.
+    std::optional<double> acquireDelayMsMean, acquireDelayMsP95, sourceToEncodedMsMean, sourceToEncodedMsP95;
+    double loopWakeupsPerSecond = 0, loopMaxMs = 0; // Engine thread iterations/s and its longest iteration
+    double sendMsMean = 0, sendMsMax = 0;           // Time spent handing frames to the transport
+    double submitIntervalMsP95 = 0, submitIntervalMsMax = 0; // Spacing between frames given to the encoder
+    double frameBytesMean = 0, frameBytesMax = 0;
+    uint64_t keyframes = 0;
     uint32_t bitrate = 0, targetBitrate = 0;
     bool dynamicBitrate = true;
     size_t queueDepth = 0;
@@ -34,6 +41,8 @@ struct MetricsSnapshot {
     std::optional<double> connectMs, firstKeyframeMs;
     // Receiver telemetry (what the browser reports back)
     std::optional<double> viewerFps, viewerBitrate, rttMs, loss, jitterMs;
+    std::optional<double> viewerJitterBufferMs, viewerDecodeMs, viewerProcessingMs; // Receiver-side delays
+    std::optional<uint32_t> receiverEstimateBps; // Browser's bandwidth estimate (REMB), for diagnostics
     std::optional<uint64_t> viewerDropped, viewerDecoded;
     PairingSnapshot pairing;
     std::chrono::steady_clock::time_point updated{};

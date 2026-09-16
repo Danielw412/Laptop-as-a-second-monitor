@@ -118,11 +118,11 @@ void fail(const std::wstring &what) {
     logError("Setup: " + narrow(what));
     MessageBoxW(nullptr, what.c_str(), L"Laptop Monitor setup", MB_ICONERROR | MB_OK);
 }
-/// What this product installed while it was called Browser Monitor. Left behind, the scheduled task would keep
+/// What this product installed while it was called Laptop Monitor. Left behind, the scheduled task would keep
 /// elevating an executable nothing drives any more, so setup clears it rather than installing alongside it.
 void removeLegacyInstall(bool includeUserData) {
-    constexpr const wchar_t *legacyTask = L"Browser Monitor Display";
-    constexpr const wchar_t *legacyRunValue = L"BrowserMonitor";
+    constexpr const wchar_t *legacyTask = L"Laptop Monitor Display";
+    constexpr const wchar_t *legacyRunValue = L"LaptopMonitor";
     {
         ComApartment com;
         ComPtr<ITaskService> service;
@@ -136,7 +136,7 @@ void removeLegacyInstall(bool includeUserData) {
         }
     }
     std::error_code ec;
-    auto legacyDir = programFilesDirectory() / L"Browser Monitor";
+    auto legacyDir = programFilesDirectory() / L"Laptop Monitor";
     if (std::filesystem::exists(legacyDir, ec)) {
         for (int attempt = 0; attempt < 8 && std::filesystem::exists(legacyDir, ec); ++attempt) {
             std::filesystem::remove_all(legacyDir, ec);
@@ -157,7 +157,7 @@ void removeLegacyInstall(bool includeUserData) {
         wchar_t local[32768];
         auto size = GetEnvironmentVariableW(L"LOCALAPPDATA", local, DWORD(std::size(local)));
         if (size && size < std::size(local))
-            std::filesystem::remove_all(std::filesystem::path(local) / L"BrowserMonitor", ec);
+            std::filesystem::remove_all(std::filesystem::path(local) / L"LaptopMonitor", ec);
     }
 }
 } // namespace

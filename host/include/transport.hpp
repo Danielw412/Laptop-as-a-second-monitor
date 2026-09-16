@@ -41,6 +41,8 @@ class ITransport {
     virtual void rotateCode() = 0;
     virtual PairingSnapshot pairing() const = 0;
     virtual void fillMetrics(MetricsSnapshot &) const = 0;
+    /// Signalled when a signaling message, telemetry or a keyframe request arrives; lets the engine sleep on it.
+    virtual HANDLE wakeEvent() const = 0;
 };
 struct TransportTestOptions {
     unsigned dropEvery = 0;

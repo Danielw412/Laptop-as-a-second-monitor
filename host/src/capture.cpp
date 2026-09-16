@@ -59,11 +59,16 @@ class Duplication final : public ICapture {
     ~Duplication() {
         release();
     }
-    std::optional<Frame> acquire() override {
+    HANDLE frameEvent() const override {
+        return nullptr; // Desktop duplication can only wait inside AcquireNextFrame.
+    }
+    std::optional<Frame> acquire(unsigned timeoutMs) override {
         release();
         DXGI_OUTDUPL_FRAME_INFO info{};
         ComPtr<IDXGIResource> resource;
-        HRESULT hr = duplication_->AcquireNextFrame(0, &info, &resource);
+        // Blocking here (rather than polling with 0) returns the instant the desktop is presented, so frames
+        // are never merged into AccumulatedFrames by a poll that came too late.
+        HRESULT hr = duplication_->AcquireNextFrame(timeoutMs, &info, &resource);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT)
             return {};
         check(hr, "AcquireNextFrame (display changed/access lost; rebuilding capture)");
@@ -75,6 +80,7 @@ class Duplication final : public ICapture {
         Frame frame;
         check(resource.As(&frame.texture), "Capture texture");
         frame.timestamp = now100ns();
+        frame.presented = qpcTo100ns(info.LastPresentTime.QuadPart);
         frame.accumulated = info.AccumulatedFrames;
         return frame;
     }

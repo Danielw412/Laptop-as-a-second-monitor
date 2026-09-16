@@ -6,6 +6,7 @@
 #include <deque>
 #include <mutex>
 #include <rtc/plihandler.hpp>
+#include <rtc/rembhandler.hpp>
 #include <rtc/rtc.hpp>
 #include <wincrypt.h>
 namespace lm {
@@ -69,12 +70,29 @@ struct Mailbox {
     std::mutex mutex;
     std::deque<Json> messages;
     std::atomic<bool> idr{false};
+    std::atomic<uint32_t> remb{0};
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr); // Auto-reset: wakes the engine thread
+    ~Mailbox() {
+        if (event)
+            CloseHandle(event);
+    }
     void push(Json j) {
-        std::lock_guard lock(mutex);
-        if (messages.size() < 256)
-            messages.push_back(std::move(j));
+        {
+            std::lock_guard lock(mutex);
+            if (messages.size() < 256)
+                messages.push_back(std::move(j));
+        }
+        SetEvent(event);
+    }
+    void requestKeyframe() {
+        idr = true;
+        SetEvent(event);
     }
 };
+// Playout-delay RTP header extension: tells the browser to render every frame as soon as it is decoded instead of
+// holding it in an adaptive jitter buffer. This is what cloud-gaming receivers rely on.
+constexpr int kPlayoutDelayExtensionId = 6;
+constexpr const char *kPlayoutDelayUri = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 class Transport final : public ITransport {
     std::shared_ptr<Mailbox> mailbox_ = std::make_shared<Mailbox>();
     std::shared_ptr<rtc::WebSocket> socket_;
@@ -235,18 +253,24 @@ class Transport final : public ITransport {
         // Baseline, level 4.2 permits 1080p60. Packetization mode 1 supports FU-A fragmentation.
         video.addH264Codec(96, "profile-level-id=42002a;packetization-mode=1;level-asymmetry-allowed=1");
         video.addSSRC(42, "laptop-monitor", "display", "video");
+        video.addExtMap(rtc::Description::Entry::ExtMap(kPlayoutDelayExtensionId, kPlayoutDelayUri));
         track_ = peer_->addTrack(video);
         rtp_ = std::make_shared<rtc::RtpPacketizationConfig>(42u, "laptop-monitor", uint8_t(96), 90000u);
+        rtp_->playoutDelayId = kPlayoutDelayExtensionId;
+        rtp_->playoutDelayMin = 0;
+        rtp_->playoutDelayMax = 0;
         auto packetizer =
             std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, rtp_, 1200);
         packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(rtp_));
         packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>(512));
-        packetizer->addToChain(std::make_shared<rtc::PliHandler>([box] { box->idr = true; }));
+        packetizer->addToChain(std::make_shared<rtc::PliHandler>([box] { box->requestKeyframe(); }));
+        // The browser's receiver-side bandwidth estimate; recorded for diagnostics only.
+        packetizer->addToChain(std::make_shared<rtc::RembHandler>([box](unsigned bps) { box->remb = bps; }));
         testLoss_ = std::make_shared<TestPacketLoss>(test_.dropEvery);
         if (test_.dropEvery)
             packetizer->addToChain(testLoss_);
         track_->setMediaHandler(packetizer);
-        track_->onOpen([box] { box->idr = true; });
+        track_->onOpen([box] { box->requestKeyframe(); });
         rtc::DataChannelInit init;
         init.reliability.unordered = true;
         init.reliability.maxRetransmits = 0;
@@ -468,6 +492,9 @@ class Transport final : public ITransport {
             return false;
         }
     }
+    HANDLE wakeEvent() const override {
+        return mailbox_->event;
+    }
     bool consumeKeyframeRequest() override {
         if (!mailbox_->idr.exchange(false))
             return false;
@@ -492,6 +519,7 @@ class Transport final : public ITransport {
                 {"encoded_bytes_sent", bytes_},
                 {"transport_dropped", dropped_},
                 {"transport_buffer_bytes", track_ ? track_->bufferedAmount() : 0},
+                {"receiver_estimate_bps", mailbox_->remb.load()},
                 {"receiver", receiver_}};
     }
     SignalingState signaling() const override {
@@ -526,6 +554,8 @@ class Transport final : public ITransport {
         m.keyframesSent = keyframesSent_;
         m.bufferBytes = track_ ? track_->bufferedAmount() : 0;
         m.targetBitrate = adaptation_.bitrate();
+        if (auto remb = mailbox_->remb.load())
+            m.receiverEstimateBps = remb;
         m.connectedSince = connectedSince_;
         static const char *const states[] = {"disconnected", "connecting", "connected", "rejected"};
         m.signalingState = states[size_t(signaling_)];
@@ -567,6 +597,9 @@ class Transport final : public ITransport {
         m.rttMs = number("rttMs");
         m.loss = number("loss");
         m.jitterMs = number("jitterMs");
+        m.viewerJitterBufferMs = number("jitterBufferMs");
+        m.viewerDecodeMs = number("decodeMs");
+        m.viewerProcessingMs = number("processingMs");
         if (auto v = number("dropped"))
             m.viewerDropped = uint64_t(std::max(0.0, *v));
         if (auto v = number("decoded"))
