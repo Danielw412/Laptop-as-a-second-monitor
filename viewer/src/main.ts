@@ -18,7 +18,7 @@ const server = el<HTMLInputElement>("server"),
 const defaultServer = import.meta.env.VITE_SIGNALING_URL ?? "https://browser-monitor-signaling.danielruoqiao.workers.dev";
 server.value = defaultServer;
 const dashboard = new Dashboard(el("dashboard-grid"));
-const storageKey = "browser-monitor-session";
+const storageKey = "laptop-monitor-session";
 type Saved = { server: string; room: string; token: string };
 let saved: Saved | undefined;
 try {
@@ -93,7 +93,7 @@ el("join").addEventListener("submit", (e) => {
   try {
     const value = normalizeCode(code.value);
     code.value = value;
-    if (!CODE_RE.test(value)) throw Error(`Enter the ${CODE_LENGTH}-character code shown in Browser Monitor.`);
+    if (!CODE_RE.test(value)) throw Error(`Enter the ${CODE_LENGTH}-character code shown in Laptop Monitor.`);
     forget();
     start({ role: "viewer", code: value });
   } catch (e) {
@@ -148,7 +148,7 @@ el("test-pattern").onclick = () =>
         ctx.fillStyle = "#adebc5";
         ctx.fillRect((frame * 12) % 1920, 0, 100, 1080);
         ctx.font = "80px monospace";
-        ctx.fillText(`Browser Monitor  ${frame++}`, 200, 500);
+        ctx.fillText(`Laptop Monitor  ${frame++}`, 200, 500);
       }, 1000 / 60);
       await testHost(canvas.captureStream(60));
     } catch (e) {

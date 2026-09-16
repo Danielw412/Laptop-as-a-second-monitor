@@ -5,7 +5,7 @@
 #include "pipeline.hpp"
 #include <iostream>
 #include <winrt/base.h>
-namespace bm {
+namespace lm {
 namespace {
 std::atomic<bool> interrupted = false;
 BOOL WINAPI control(DWORD) {
@@ -16,7 +16,7 @@ struct Options {
     std::string display, backend = "auto", mode = "capture-encode", server = kDefaultSignalingUrl, csv;
     unsigned fps = 60, seconds = 0;
     bool list = false, allowPrimary = false, pattern = false, synthetic = false, flushGpu = false,
-         browserMon = false;
+         laptopMon = false;
     TransportTestOptions test;
 };
 Options parse(int argc, char **argv) {
@@ -34,8 +34,8 @@ Options parse(int argc, char **argv) {
             o.pattern = true;
         else if (a == "--synthetic")
             o.synthetic = true;
-        else if (a == "--browsermon")
-            o.browserMon = true;
+        else if (a == "--laptopmon")
+            o.laptopMon = true;
         else if (a == "--test-drop-every")
             o.test.dropEvery = std::stoul(value());
         else if (a == "--test-drop-first-keyframe")
@@ -79,13 +79,13 @@ int run(int argc, char **argv) {
         std::cout << d.name << " | " << d.gpu << " | " << d.rect.right - d.rect.left << 'x'
                   << d.rect.bottom - d.rect.top << (d.primary ? " | PRIMARY" : " | secondary") << '\n';
     for (const auto &t : queryDisplayTargets())
-        if (isBrowserMon(t))
-            std::cout << "BrowserMon: " << (t.gdiName.empty() ? "(inactive)" : t.gdiName) << " | " << t.devicePath
+        if (isLaptopMon(t))
+            std::cout << "LaptopMon: " << (t.gdiName.empty() ? "(inactive)" : t.gdiName) << " | " << t.devicePath
                       << (t.cloned ? " | DUPLICATE" : "") << (t.primary ? " | PRIMARY" : "") << '\n';
     if (o.list)
         return 0;
-    if (o.display.empty() && !o.browserMon && !o.synthetic && o.mode != "encode")
-        throw std::runtime_error("Choose a source: --display \\\\.\\DISPLAYn (from --list) or --browsermon");
+    if (o.display.empty() && !o.laptopMon && !o.synthetic && o.mode != "encode")
+        throw std::runtime_error("Choose a source: --display \\\\.\\DISPLAYn (from --list) or --laptopmon");
     EngineConfig config;
     config.mode = parseMode(o.mode);
     config.backend = o.backend == "wgc" ? CaptureBackend::Wgc
@@ -103,8 +103,8 @@ int run(int argc, char **argv) {
     if (config.mode == PipelineMode::Stream)
         config.hostSecret = loadOrCreateHostSecret(credentialPath());
     const bool allowPrimary = o.allowPrimary || o.synthetic || config.mode == PipelineMode::Encode;
-    if (o.browserMon)
-        config.matcher = [allowPrimary] { return matchBrowserMon(allowPrimary); };
+    if (o.laptopMon)
+        config.matcher = [allowPrimary] { return matchLaptopMon(allowPrimary); };
     else if (!o.display.empty())
         config.matcher = [name = o.display, allowPrimary] { return matchNamedDisplay(name, allowPrimary); };
     else
@@ -159,14 +159,14 @@ int run(int argc, char **argv) {
     return 0;
 }
 } // namespace
-} // namespace bm
+} // namespace lm
 int main(int argc, char **argv) {
     try {
-        return bm::run(argc, argv);
+        return lm::run(argc, argv);
     } catch (const std::exception &e) {
-        std::cerr << "browser-monitor-bench: " << e.what()
-                  << "\nUsage: browser-monitor-bench --list\n"
-                     "  --browsermon | --display \\\\.\\DISPLAYn\n"
+        std::cerr << "laptop-monitor-bench: " << e.what()
+                  << "\nUsage: laptop-monitor-bench --list\n"
+                     "  --laptopmon | --display \\\\.\\DISPLAYn\n"
                      "  --mode capture|convert|encode|capture-encode|stream --capture auto|dxgi|wgc --fps 60\n"
                      "  --seconds 30 --csv results.csv --pattern --synthetic --allow-primary\n";
         return 1;

@@ -1,11 +1,11 @@
-// BrowserMonitorDisplay: the only elevated piece. It creates the software device that loads the BrowserMonitorIdd
+// LaptopMonitorDisplay: the only elevated piece. It creates the software device that loads the LaptopMonitorIdd
 // driver (the virtual monitor exists while this process holds the device) and takes exactly two commands from the
 // unelevated app over a named pipe: stop and ping. It exits, removing the monitor, when told to, when the pipe
 // closes, or when the app process that started it goes away.
 //
-//   BrowserMonitorDisplay.exe --serve <appPid>:<nonce>
+//   LaptopMonitorDisplay.exe --serve <appPid>:<nonce>
 //
-// Started through the "Browser Monitor Display" scheduled task that setup registers with highest privileges.
+// Started through the "Laptop Monitor Display" scheduled task that setup registers with highest privileges.
 #include <windows.h>
 #include <sddl.h>
 #include <shellapi.h>
@@ -81,7 +81,7 @@ int serve(const std::wstring &argument) {
     SECURITY_ATTRIBUTES sa{};
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     auto security = pipeSecurity(sa, descriptor);
-    std::wstring pipeName = L"\\\\.\\pipe\\BrowserMonitor.Display." + nonce;
+    std::wstring pipeName = L"\\\\.\\pipe\\LaptopMonitor.Display." + nonce;
     HANDLE pipe = CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
                                    4096, 4096, 0, security);
@@ -93,14 +93,14 @@ int serve(const std::wstring &argument) {
     Creation creation;
     SW_DEVICE_CREATE_INFO info{};
     info.cbSize = sizeof info;
-    info.pszInstanceId = L"BrowserMonitorIdd";
-    info.pszzHardwareIds = L"BrowserMonitorIdd\0\0";
-    info.pszzCompatibleIds = L"BrowserMonitorIdd\0\0";
-    info.pszDeviceDescription = L"Browser Monitor Virtual Display";
+    info.pszInstanceId = L"LaptopMonitorIdd";
+    info.pszzHardwareIds = L"LaptopMonitorIdd\0\0";
+    info.pszzCompatibleIds = L"LaptopMonitorIdd\0\0";
+    info.pszDeviceDescription = L"Laptop Monitor Virtual Display";
     info.CapabilityFlags =
         SWDeviceCapabilitiesRemovable | SWDeviceCapabilitiesSilentInstall | SWDeviceCapabilitiesDriverRequired;
     HSWDEVICE device = nullptr;
-    HRESULT hr = SwDeviceCreate(L"BrowserMonitorIdd", L"HTREE\\ROOT\\0", &info, 0, nullptr, created, &creation, &device);
+    HRESULT hr = SwDeviceCreate(L"LaptopMonitorIdd", L"HTREE\\ROOT\\0", &info, 0, nullptr, created, &creation, &device);
     std::string status;
     if (FAILED(hr))
         status = "error " + std::to_string(uint32_t(hr)) + " SwDeviceCreate failed";
@@ -190,9 +190,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         code = 0;
     } else
         MessageBoxW(nullptr,
-                    L"BrowserMonitorDisplay is started by Browser Monitor through its scheduled task.\n"
-                    L"Run BrowserMonitor.exe instead.",
-                    L"Browser Monitor", MB_ICONINFORMATION);
+                    L"LaptopMonitorDisplay is started by Laptop Monitor through its scheduled task.\n"
+                    L"Run LaptopMonitor.exe instead.",
+                    L"Laptop Monitor", MB_ICONINFORMATION);
     LocalFree(argv);
     return code;
 }

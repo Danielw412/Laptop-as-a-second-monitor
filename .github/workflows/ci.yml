@@ -31,9 +31,9 @@ jobs:
         run: ./scripts/build-host.ps1
       - uses: actions/upload-artifact@v4
         with:
-          name: browser-monitor-windows-x64
+          name: laptop-monitor-windows-x64
           path: |
-            build/host/BrowserMonitor.exe
-            build/host/BrowserMonitorDisplay.exe
-            build/host/browser-monitor-bench.exe
+            build/host/LaptopMonitor.exe
+            build/host/LaptopMonitorDisplay.exe
+            build/host/laptop-monitor-bench.exe
             README.md

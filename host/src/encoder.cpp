@@ -4,7 +4,7 @@
 #include <map>
 #include <mferror.h>
 #include <strmif.h>
-namespace bm {
+namespace lm {
 // A texture becomes writable only after the MFT releases its input sample.
 class Released final : public IMFAsyncCallback {
     std::atomic<ULONG> refs_{1};
@@ -338,4 +338,4 @@ std::unique_ptr<IEncoder> hardwareEncoder(Device &device, const Display &display
     throw std::runtime_error("No compatible D3D11 hardware H264 encoder on the display GPU. No CPU-readback "
                              "or cross-GPU fallback is enabled.");
 }
-} // namespace bm
+} // namespace lm

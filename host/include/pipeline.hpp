@@ -9,7 +9,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
-namespace bm {
+namespace lm {
 enum class PipelineMode { Capture, Convert, Encode, CaptureEncode, Stream };
 using DisplayMatcher = std::function<DisplayMatch()>;
 struct EngineConfig {
@@ -86,4 +86,4 @@ class StreamingEngine {
     void publish(const MetricsSnapshot &);
 };
 PipelineMode parseMode(const std::string &);
-} // namespace bm
+} // namespace lm

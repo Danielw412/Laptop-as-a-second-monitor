@@ -6,7 +6,7 @@
 #include <span>
 #include <stdexcept>
 #include <vector>
-namespace bm {
+namespace lm {
 class BitrateController {
     uint32_t bitrate_ = 8000000, minimum_ = 1500000, maximum_ = 16000000;
     int good_ = 0;
@@ -88,4 +88,4 @@ inline std::vector<uint8_t> annexB(std::span<const uint8_t> bytes) {
 inline uint32_t rtpTimestamp(int64_t sample100ns) {
     return uint32_t((uint64_t(sample100ns) * 9) / 1000);
 }
-} // namespace bm
+} // namespace lm

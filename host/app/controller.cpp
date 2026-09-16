@@ -2,9 +2,9 @@
 #include "app.hpp"
 #include "display_query.hpp"
 #include "logging.hpp"
-namespace bm::app {
+namespace lm::app {
 namespace {
-constexpr int kFindPollLimit = 60; // 60 polls at 250 ms = 15 s for BrowserMon to appear after device creation
+constexpr int kFindPollLimit = 60; // 60 polls at 250 ms = 15 s for LaptopMon to appear after device creation
 } // namespace
 AppController::AppController(HWND window, SettingsStore store, Settings settings, std::string hostSecret)
     : window_(window), store_(std::move(store)), settings_(std::move(settings)), hostSecret_(std::move(hostSecret)),
@@ -17,6 +17,8 @@ AppController::AppController(HWND window, SettingsStore store, Settings settings
     });
 }
 AppController::~AppController() {
+    // Teardown order matters. Everything that can still call back into this object has to be stopped and joined
+    // here, while the members those callbacks touch (the event queue, the log buffer) are all still alive.
     Log::instance().setSink({});
     if (engine_) {
         engine_->requestStop();
@@ -24,6 +26,7 @@ AppController::~AppController() {
     }
     for (auto &e : retired_)
         e->join();
+    display_.shutdown();
     if (setupWaiter_.joinable())
         setupWaiter_.join();
 }
@@ -95,10 +98,13 @@ void AppController::execute(const Effect &effect) {
         break;
     case EffectType::StartDisplay:
         logInfo("Starting the virtual display through the elevated helper");
+        // A new device is a new monitor to Windows, including after the helper restarted on its own.
+        scaleApplied_ = false;
         display_.start();
         break;
     case EffectType::StopDisplay:
         logInfo("Stopping the virtual display");
+        scaleApplied_ = false;
         display_.stop();
         break;
     case EffectType::StartEngine:
@@ -121,12 +127,14 @@ void AppController::execute(const Effect &effect) {
     }
 }
 void AppController::findDisplay() {
-    auto match = matchBrowserMon(false);
+    auto match = matchLaptopMon(false);
     if (match.display) {
         findArmed_ = false;
         findPolls_ = 0;
         KillTimer(window_, TIMER_FIND);
-        logInfo("BrowserMon found on " + match.display->name + " (" + match.display->gpu + ")");
+        logInfo("LaptopMon found on " + match.display->name + " (" + match.display->gpu + ")");
+        if (match.target)
+            applyScale(*match.target, false);
         dispatch({display_.owned() ? EventType::DisplayFound : EventType::DisplayFoundExternal});
         return;
     }
@@ -161,7 +169,7 @@ void AppController::displayChanged() {
         return;
     }
     if (model_.display == DisplayStatus::Active || model_.display == DisplayStatus::External) {
-        auto match = matchBrowserMon(false);
+        auto match = matchLaptopMon(false);
         if (!match.display) {
             dispatch({EventType::DisplayLost, match.detail});
             findPolls_ = 0;
@@ -182,7 +190,7 @@ void AppController::startEngine() {
     config.bitrate = bitratePlan(settings_.quality);
     config.signalingUrl = settings_.signalingUrl;
     config.hostSecret = hostSecret_;
-    config.matcher = [] { return matchBrowserMon(false); };
+    config.matcher = [] { return matchLaptopMon(false); };
     const uint64_t generation = ++engineGeneration_;
     try {
         engine_ = std::make_unique<StreamingEngine>(
@@ -303,6 +311,7 @@ void AppController::updateSettings(const Settings &updated) {
     auto clean = sanitized(updated);
     const bool restartNeeded = clean.backend != settings_.backend || clean.fps != settings_.fps ||
                                clean.quality != settings_.quality || clean.signalingUrl != settings_.signalingUrl;
+    const bool rescale = clean.displayScale != settings_.displayScale;
     if (clean.startAtSignIn != settings_.startAtSignIn)
         setStartAtSignIn(clean.startAtSignIn);
     if (clean.diagnosticsLog != settings_.diagnosticsLog) {
@@ -318,12 +327,49 @@ void AppController::updateSettings(const Settings &updated) {
     } catch (const std::exception &e) {
         logWarning(std::string("Saving settings failed: ") + e.what());
     }
+    if (rescale) {
+        // Scaling is a property of the monitor, not of the stream: apply it in place, nothing restarts.
+        auto match = matchLaptopMon(false);
+        if (match.target)
+            applyScale(*match.target, true);
+        else
+            notification_ = "Display scaling will be applied when the virtual display is running.";
+    }
     if (restartNeeded && model_.stream != StreamStatus::Stopped) {
         // Apply pipeline settings by restarting only the stream, not the display.
         logInfo("Settings changed; restarting the stream");
         dispatch({EventType::UserStopStreaming});
         model_.wantStream = true;
     }
+}
+void AppController::applyScale(const DisplayTarget &target, bool force) {
+    // Windows keeps a per-monitor scale of its own, so this runs once per display session (and again whenever the
+    // user changes the setting). Leaving it alone afterwards means a manual change in Settings sticks.
+    if (scaleApplied_ && !force)
+        return;
+    scaleApplied_ = true;
+    const unsigned wanted = scalePercent(settings_.displayScale);
+    auto info = displayScaleOf(target);
+    if (!wanted) {
+        // Recommended: whatever the EDID's 13.3" physical size makes Windows choose.
+        if (info)
+            logInfo("Virtual display scaling left at " + std::to_string(info->current) + "% (Windows recommends " +
+                    std::to_string(info->recommended) + "%)");
+        return;
+    }
+    if (info && info->current == wanted) {
+        logInfo("Virtual display already scaled to " + std::to_string(wanted) + "%");
+        return;
+    }
+    auto result = applyDisplayScale(target, wanted);
+    if (result.applied) {
+        logInfo("Virtual display scaled to " + std::to_string(result.percent) + "%");
+        return;
+    }
+    // Windows would not do it for us, so say exactly what to do by hand instead of failing quietly.
+    logWarning("Could not scale the virtual display: " + result.problem);
+    notification_ = result.problem + " Set it by hand in Settings > System > Display: pick " +
+                    std::string(kLaptopMonFriendlyName) + ", then Scale " + std::to_string(wanted) + "%.";
 }
 MetricsSnapshot AppController::metrics() const {
     return engine_ ? engine_->snapshot() : MetricsSnapshot{};
@@ -344,4 +390,4 @@ std::vector<std::string> AppController::recentLog() const {
     std::lock_guard lock(logMutex_);
     return {log_.begin(), log_.end()};
 }
-} // namespace bm::app
+} // namespace lm::app

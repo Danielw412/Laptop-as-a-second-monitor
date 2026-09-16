@@ -5,7 +5,7 @@
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <winrt/Windows.Graphics.DirectX.h>
-namespace bm {
+namespace lm {
 using namespace winrt::Windows::Graphics;
 namespace {
 // C++/WinRT reports failures as winrt::hresult_error, which is not a std::exception. Everything leaving this file
@@ -102,4 +102,4 @@ class Wgc final : public ICapture {
 std::unique_ptr<ICapture> wgc(Device &d, const Display &s) {
     return std::make_unique<Wgc>(d, s);
 }
-} // namespace bm
+} // namespace lm

@@ -11,7 +11,7 @@
 #include <taskschd.h>
 #include <wrl/client.h>
 using Microsoft::WRL::ComPtr;
-namespace bm::app {
+namespace lm::app {
 namespace {
 struct ComApartment {
     HRESULT hr;
@@ -89,7 +89,7 @@ std::string fileHash(const std::filesystem::path &path) {
     return hexLower(digest.data(), digest.size());
 }
 std::filesystem::path findScript(const wchar_t *name) {
-    // Development layout: <repo>/build/<dir>/BrowserMonitor.exe with scripts in <repo>/scripts. Also accept a
+    // Development layout: <repo>/build/<dir>/LaptopMonitor.exe with scripts in <repo>/scripts. Also accept a
     // scripts folder next to the executable for a copied distribution.
     auto exe = std::filesystem::path(modulePath()).parent_path();
     for (auto candidate : {exe / L"scripts" / name, exe.parent_path().parent_path() / L"scripts" / name,
@@ -116,7 +116,49 @@ int runProcess(const std::wstring &commandLine) {
 }
 void fail(const std::wstring &what) {
     logError("Setup: " + narrow(what));
-    MessageBoxW(nullptr, what.c_str(), L"Browser Monitor setup", MB_ICONERROR | MB_OK);
+    MessageBoxW(nullptr, what.c_str(), L"Laptop Monitor setup", MB_ICONERROR | MB_OK);
+}
+/// What this product installed while it was called Browser Monitor. Left behind, the scheduled task would keep
+/// elevating an executable nothing drives any more, so setup clears it rather than installing alongside it.
+void removeLegacyInstall(bool includeUserData) {
+    constexpr const wchar_t *legacyTask = L"Browser Monitor Display";
+    constexpr const wchar_t *legacyRunValue = L"BrowserMonitor";
+    {
+        ComApartment com;
+        ComPtr<ITaskService> service;
+        ComPtr<ITaskFolder> root;
+        ComPtr<IRegisteredTask> task;
+        if (SUCCEEDED(openTaskFolder(service, root)) && SUCCEEDED(root->GetTask(Bstr(legacyTask), &task))) {
+            task->Stop(0);
+            Sleep(500);
+            if (SUCCEEDED(root->DeleteTask(Bstr(legacyTask), 0)))
+                logInfo("Setup: removed the legacy scheduled task");
+        }
+    }
+    std::error_code ec;
+    auto legacyDir = programFilesDirectory() / L"Browser Monitor";
+    if (std::filesystem::exists(legacyDir, ec)) {
+        for (int attempt = 0; attempt < 8 && std::filesystem::exists(legacyDir, ec); ++attempt) {
+            std::filesystem::remove_all(legacyDir, ec);
+            if (std::filesystem::exists(legacyDir, ec))
+                Sleep(250);
+        }
+        logInfo(std::filesystem::exists(legacyDir, ec) ? "Setup: could not remove " + legacyDir.string()
+                                                       : "Setup: removed " + legacyDir.string());
+    }
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE,
+                      &key) == ERROR_SUCCESS) {
+        if (RegDeleteValueW(key, legacyRunValue) == ERROR_SUCCESS)
+            logInfo("Setup: removed the legacy start-at-sign-in entry");
+        RegCloseKey(key);
+    }
+    if (includeUserData) {
+        wchar_t local[32768];
+        auto size = GetEnvironmentVariableW(L"LOCALAPPDATA", local, DWORD(std::size(local)));
+        if (size && size < std::size(local))
+            std::filesystem::remove_all(std::filesystem::path(local) / L"BrowserMonitor", ec);
+    }
 }
 } // namespace
 std::string SetupStatus::summary() const {
@@ -134,10 +176,10 @@ std::string SetupStatus::summary() const {
     return s;
 }
 std::filesystem::path installedHelperPath() {
-    return programFilesDirectory() / L"Browser Monitor" / L"BrowserMonitorDisplay.exe";
+    return programFilesDirectory() / L"Laptop Monitor" / L"LaptopMonitorDisplay.exe";
 }
 std::filesystem::path bundledHelperPath() {
-    return std::filesystem::path(modulePath()).parent_path() / L"BrowserMonitorDisplay.exe";
+    return std::filesystem::path(modulePath()).parent_path() / L"LaptopMonitorDisplay.exe";
 }
 bool driverPackageStaged() {
     std::error_code ec;
@@ -145,7 +187,7 @@ bool driverPackageStaged() {
     for (auto &entry : std::filesystem::directory_iterator(repository, ec)) {
         auto name = entry.path().filename().wstring();
         std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return wchar_t(::towlower(c)); });
-        if (name.starts_with(L"browsermonitoridd.inf_") && entry.is_directory(ec))
+        if (name.starts_with(L"laptopmonitoridd.inf_") && entry.is_directory(ec))
             return true;
     }
     return false;
@@ -222,15 +264,16 @@ HANDLE launchElevated(HWND owner, const wchar_t *argument, std::wstring &error) 
 }
 int performSetup() {
     if (!isElevated()) {
-        fail(L"Setup must run elevated. Start it from Browser Monitor's Settings page.");
+        fail(L"Setup must run elevated. Start it from Laptop Monitor's Settings page.");
         return 1;
     }
     logInfo("Setup: starting");
+    removeLegacyInstall(false);
     // 1. Driver package.
     if (!driverPackageStaged()) {
         auto script = findScript(L"install-driver.ps1");
         if (script.empty()) {
-            fail(L"The BrowserMonitorIdd driver package is not installed and scripts\\install-driver.ps1 was not "
+            fail(L"The LaptopMonitorIdd driver package is not installed and scripts\\install-driver.ps1 was not "
                  L"found next to this build. Build and install the driver first (see README).");
             return 2;
         }
@@ -246,7 +289,7 @@ int performSetup() {
     auto source = bundledHelperPath(), target = installedHelperPath();
     std::error_code ec;
     if (!std::filesystem::exists(source, ec)) {
-        fail(L"BrowserMonitorDisplay.exe was not found next to BrowserMonitor.exe.");
+        fail(L"LaptopMonitorDisplay.exe was not found next to LaptopMonitor.exe.");
         return 4;
     }
     std::filesystem::create_directories(target.parent_path(), ec);
@@ -279,9 +322,9 @@ int performSetup() {
         hr = service->NewTask(0, &definition);
     ComPtr<IRegistrationInfo> registration;
     if (SUCCEEDED(hr) && SUCCEEDED(definition->get_RegistrationInfo(&registration))) {
-        registration->put_Author(Bstr(L"Browser Monitor"));
-        registration->put_Description(Bstr(L"Starts the Browser Monitor virtual display helper on demand. Registered "
-                                            L"by Browser Monitor setup; removed by its uninstall."));
+        registration->put_Author(Bstr(L"Laptop Monitor"));
+        registration->put_Description(Bstr(L"Starts the Laptop Monitor virtual display helper on demand. Registered "
+                                            L"by Laptop Monitor setup; removed by its uninstall."));
     }
     ComPtr<IPrincipal> principal;
     if (SUCCEEDED(hr))
@@ -341,10 +384,11 @@ int performSetup() {
 }
 int performUninstall() {
     if (!isElevated()) {
-        fail(L"Uninstall must run elevated. Start it from Browser Monitor's Settings page.");
+        fail(L"Uninstall must run elevated. Start it from Laptop Monitor's Settings page.");
         return 1;
     }
     logInfo("Uninstall: starting");
+    removeLegacyInstall(true);
     int problems = 0;
     {
         ComApartment com;
@@ -386,7 +430,7 @@ int performUninstall() {
         if (code != 0)
             ++problems;
     } else if (driverPackageStaged()) {
-        runProcess(L"pnputil.exe /remove-device /deviceid BrowserMonitorIdd");
+        runProcess(L"pnputil.exe /remove-device /deviceid LaptopMonitorIdd");
         // Without the script, look up the published name and delete the package.
         SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
         HANDLE readEnd, writeEnd;
@@ -408,12 +452,12 @@ int performUninstall() {
                 WaitForSingleObject(pi.hProcess, INFINITE);
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
-                // Blocks look like "Published Name: oem149.inf\r\nOriginal Name: browsermonitoridd.inf".
+                // Blocks look like "Published Name: oem149.inf\r\nOriginal Name: laptopmonitoridd.inf".
                 size_t pos = 0;
                 std::string lower = output;
                 std::transform(lower.begin(), lower.end(), lower.begin(),
                                [](unsigned char c) { return char(std::tolower(c)); });
-                while ((pos = lower.find("browsermonitoridd.inf", pos)) != std::string::npos) {
+                while ((pos = lower.find("laptopmonitoridd.inf", pos)) != std::string::npos) {
                     auto published = lower.rfind("oem", pos);
                     if (published != std::string::npos) {
                         auto end = lower.find(".inf", published);
@@ -429,8 +473,8 @@ int performUninstall() {
     }
     logInfo("Uninstall: complete");
     if (problems)
-        MessageBoxW(nullptr, L"Browser Monitor was removed, but some items could not be cleaned up. See the log.",
-                    L"Browser Monitor", MB_ICONWARNING | MB_OK);
+        MessageBoxW(nullptr, L"Laptop Monitor was removed, but some items could not be cleaned up. See the log.",
+                    L"Laptop Monitor", MB_ICONWARNING | MB_OK);
     return problems ? 2 : 0;
 }
 bool startAtSignIn() {
@@ -461,4 +505,4 @@ std::wstring modulePath() {
     DWORD n = GetModuleFileNameW(nullptr, buffer, DWORD(std::size(buffer)));
     return std::wstring(buffer, n);
 }
-} // namespace bm::app
+} // namespace lm::app

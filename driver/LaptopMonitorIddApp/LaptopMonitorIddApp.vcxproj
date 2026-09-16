@@ -14,7 +14,7 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>
     <ProjectGuid>{ED59DFCA-E75B-4DD8-B5C2-6BFF77A225A6}</ProjectGuid>
-    <RootNamespace>BrowserMonitorIddApp</RootNamespace>
+    <RootNamespace>LaptopMonitorIddApp</RootNamespace>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">

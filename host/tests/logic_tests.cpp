@@ -1,4 +1,4 @@
-// Portable tests for pairing, BrowserMon detection, lifecycle state transitions, settings and hashing.
+// Portable tests for pairing, LaptopMon detection, lifecycle state transitions, settings and hashing.
 #include "app_state.hpp"
 #include "display_identity.hpp"
 #include "pairing.hpp"
@@ -11,7 +11,7 @@
 #include <iostream>
 #include <set>
 #include <stdexcept>
-using namespace bm;
+using namespace lm;
 using namespace std::chrono_literals;
 namespace {
 int failures = 0;
@@ -158,12 +158,12 @@ void testForcedRotation() {
         CHECK(seen.insert(many.current()).second);
     }
 }
-DisplayTarget browserMon(std::string gdi = "\\\\.\\DISPLAY7") {
+DisplayTarget laptopMon(std::string gdi = "\\\\.\\DISPLAY7") {
     DisplayTarget t;
     t.gdiName = gdi;
-    t.devicePath = "\\\\?\\DISPLAY#BMV0001#1&1eee597c&2&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
-    t.friendlyName = "BrowserMon";
-    t.edidManufacturer = 0x09B6;
+    t.devicePath = "\\\\?\\DISPLAY#LMV0001#1&1eee597c&2&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+    t.friendlyName = "LaptopMon";
+    t.edidManufacturer = 0x31B6;
     t.edidProduct = 1;
     t.active = true;
     return t;
@@ -180,56 +180,56 @@ DisplayTarget laptopPanel() {
     return t;
 }
 void testDetection() {
-    CHECK(isBrowserMon(browserMon()));
-    CHECK(!isBrowserMon(laptopPanel()));
+    CHECK(isLaptopMon(laptopMon()));
+    CHECK(!isLaptopMon(laptopPanel()));
     // Any one of the EDID-derived markers is enough; the DISPLAYn number is irrelevant.
-    auto pathOnly = browserMon("\\\\.\\DISPLAY2");
+    auto pathOnly = laptopMon("\\\\.\\DISPLAY2");
     pathOnly.friendlyName = "";
     pathOnly.edidManufacturer = 0;
     pathOnly.edidProduct = 0;
-    CHECK(isBrowserMon(pathOnly));
-    auto edidOnly = browserMon("\\\\.\\DISPLAY9");
+    CHECK(isLaptopMon(pathOnly));
+    auto edidOnly = laptopMon("\\\\.\\DISPLAY9");
     edidOnly.devicePath = "\\\\?\\DISPLAY#XXX#";
     edidOnly.friendlyName = "";
-    CHECK(isBrowserMon(edidOnly));
-    edidOnly.edidManufacturer = 0xB609; // byte-swapped as some APIs report it
-    CHECK(isBrowserMon(edidOnly));
+    CHECK(isLaptopMon(edidOnly));
+    edidOnly.edidManufacturer = 0xB631; // byte-swapped as some APIs report it
+    CHECK(isLaptopMon(edidOnly));
     edidOnly.edidProduct = 2;
-    CHECK(!isBrowserMon(edidOnly));
-    auto nameOnly = browserMon();
+    CHECK(!isLaptopMon(edidOnly));
+    auto nameOnly = laptopMon();
     nameOnly.devicePath = "";
     nameOnly.edidManufacturer = 0;
     nameOnly.edidProduct = 0;
-    CHECK(isBrowserMon(nameOnly));
-    // Selection ignores physical displays entirely and reports what is wrong with BrowserMon.
-    auto sel = selectBrowserMon({laptopPanel(), browserMon()});
+    CHECK(isLaptopMon(nameOnly));
+    // Selection ignores physical displays entirely and reports what is wrong with LaptopMon.
+    auto sel = selectLaptopMon({laptopPanel(), laptopMon()});
     CHECK(sel.problem == SelectionProblem::None);
     CHECK(sel.display && sel.display->gdiName == "\\\\.\\DISPLAY7");
-    sel = selectBrowserMon({laptopPanel()});
+    sel = selectLaptopMon({laptopPanel()});
     CHECK(sel.problem == SelectionProblem::NotFound);
     CHECK(!sel.display);
-    sel = selectBrowserMon({});
+    sel = selectLaptopMon({});
     CHECK(sel.problem == SelectionProblem::NotFound);
-    // Primary protection: BrowserMon set as primary is refused, and the laptop panel is never substituted.
-    auto primaryMon = browserMon();
+    // Primary protection: LaptopMon set as primary is refused, and the laptop panel is never substituted.
+    auto primaryMon = laptopMon();
     primaryMon.primary = true;
     auto secondaryPanel = laptopPanel();
     secondaryPanel.primary = false;
-    sel = selectBrowserMon({secondaryPanel, primaryMon});
+    sel = selectLaptopMon({secondaryPanel, primaryMon});
     CHECK(sel.problem == SelectionProblem::Primary);
-    CHECK(sel.display && isBrowserMon(*sel.display));
+    CHECK(sel.display && isLaptopMon(*sel.display));
     // Duplicate mode and inactive targets are reported so the app can switch to Extend.
-    auto cloned = browserMon("\\\\.\\DISPLAY1");
+    auto cloned = laptopMon("\\\\.\\DISPLAY1");
     cloned.cloned = true;
-    CHECK(selectBrowserMon({laptopPanel(), cloned}).problem == SelectionProblem::Cloned);
-    auto inactive = browserMon("");
+    CHECK(selectLaptopMon({laptopPanel(), cloned}).problem == SelectionProblem::Cloned);
+    auto inactive = laptopMon("");
     inactive.active = false;
-    CHECK(selectBrowserMon({laptopPanel(), inactive}).problem == SelectionProblem::Inactive);
-    auto detached = browserMon();
+    CHECK(selectLaptopMon({laptopPanel(), inactive}).problem == SelectionProblem::Inactive);
+    auto detached = laptopMon();
     detached.available = false;
-    CHECK(selectBrowserMon({laptopPanel(), detached}).problem == SelectionProblem::NotFound);
+    CHECK(selectLaptopMon({laptopPanel(), detached}).problem == SelectionProblem::NotFound);
     // A usable instance wins over a stale unavailable one (reinstall leaves old devnodes behind).
-    CHECK(selectBrowserMon({detached, inactive, browserMon("\\\\.\\DISPLAY12")}).display->gdiName == "\\\\.\\DISPLAY12");
+    CHECK(selectLaptopMon({detached, inactive, laptopMon("\\\\.\\DISPLAY12")}).display->gdiName == "\\\\.\\DISPLAY12");
     CHECK(std::string(describe(SelectionProblem::Primary)).find("primary") != std::string::npos);
 }
 bool has(const std::vector<Effect> &effects, EffectType type) {
@@ -253,7 +253,7 @@ AppModel readyModel() {
     m.setupReady = true;
     auto fx = step(m, EventType::Init);
     CHECK(has(fx, EffectType::FindDisplay));
-    fx = step(m, EventType::DisplayNotFound, "BrowserMon is not connected");
+    fx = step(m, EventType::DisplayNotFound, "LaptopMon is not connected");
     CHECK(has(fx, EffectType::StartDisplay));
     CHECK(m.phase == Phase::StartingDisplay);
     fx = step(m, EventType::DisplayStarted);
@@ -293,7 +293,7 @@ void testSetupRequired() {
     fx = step(m, EventType::DisplayNotFound);
     CHECK(!has(fx, EffectType::StartDisplay)); // Never tries to elevate without setup
     CHECK(m.phase == Phase::SetupRequired);
-    // An externally created BrowserMon (e.g. the sample app) is still usable without setup.
+    // An externally created LaptopMon (e.g. the sample app) is still usable without setup.
     fx = step(m, EventType::DisplayFoundExternal);
     CHECK(has(fx, EffectType::StartEngine));
     CHECK(m.display == DisplayStatus::External);
@@ -387,6 +387,68 @@ void testStopMonitor() {
     fx = step(d, EventType::UserStopMonitor);
     CHECK(has(fx, EffectType::StopDisplay));
     CHECK(!has(fx, EffectType::StopEngine));
+}
+/// Start -> stop -> start, several times over, is the path that used to leave the app wedged. The reducer must
+/// come back to exactly the same state every lap and never overlap a teardown with the next start.
+void testRepeatedMonitorCycles() {
+    auto m = readyModel();
+    for (int lap = 0; lap < 4; ++lap) {
+        auto fx = step(m, EventType::UserStopMonitor);
+        CHECK(count(fx, EffectType::StopEngine) == 1);
+        CHECK(!has(fx, EffectType::StopDisplay)); // Streaming always stops first
+        CHECK(m.phase == Phase::Stopping);
+        fx = step(m, EventType::EngineStopped);
+        CHECK(count(fx, EffectType::StopDisplay) == 1);
+        CHECK(!has(fx, EffectType::StartEngine));
+        fx = step(m, EventType::DisplayStopped);
+        CHECK(fx.empty());
+        CHECK(m.phase == Phase::Idle);
+        CHECK(m.display == DisplayStatus::Stopped);
+        CHECK(m.stream == StreamStatus::Stopped);
+        CHECK(m.viewer == ViewerStatus::None);
+        CHECK(m.signaling == SignalingStatus::Disconnected);
+        CHECK(!m.stopDisplayPending);
+        CHECK(m.error.empty());
+        // ...and back up again.
+        fx = step(m, EventType::UserStartMonitor);
+        CHECK(count(fx, EffectType::FindDisplay) == 1);
+        fx = step(m, EventType::DisplayNotFound, "LaptopMon is not connected");
+        CHECK(count(fx, EffectType::StartDisplay) == 1);
+        fx = step(m, EventType::DisplayStarted);
+        CHECK(has(fx, EffectType::FindDisplay));
+        fx = step(m, EventType::DisplayFound);
+        CHECK(count(fx, EffectType::StartEngine) == 1);
+        step(m, EventType::EngineStarted);
+        step(m, EventType::EncoderReady);
+        step(m, EventType::SignalingConnected);
+        CHECK(m.phase == Phase::Ready);
+        CHECK(m.displayRetries == 0);
+    }
+    // Exiting while a receiver is connected still unwinds in order, one effect each.
+    step(m, EventType::ViewerJoined);
+    step(m, EventType::WebRtcConnected);
+    auto fx = step(m, EventType::UserExit);
+    CHECK(count(fx, EffectType::StopEngine) == 1);
+    fx = step(m, EventType::EngineStopped);
+    CHECK(count(fx, EffectType::StopDisplay) == 1);
+    fx = step(m, EventType::DisplayStopped);
+    CHECK(count(fx, EffectType::Quit) == 1);
+    // The helper timing out instead of confirming reaches the same place: the app never stays in Stopping.
+    auto t = readyModel();
+    step(t, EventType::UserStopMonitor);
+    step(t, EventType::EngineStopped);
+    fx = step(t, EventType::DisplayStopped); // Posted by the worker's stop deadline, not by the helper
+    CHECK(t.phase == Phase::Idle);
+    CHECK(t.display == DisplayStatus::Stopped);
+    // A helper that dies on its own during a requested stop is a clean stop, not an unexpected exit.
+    auto h = readyModel();
+    step(h, EventType::UserStopMonitor);
+    step(h, EventType::EngineStopped);
+    CHECK(h.display == DisplayStatus::Stopping);
+    fx = step(h, EventType::DisplayHelperExited);
+    CHECK(h.phase == Phase::Idle);
+    CHECK(h.display == DisplayStatus::Stopped);
+    CHECK(!has(fx, EffectType::StartDisplay)); // Not a crash to recover from: the user asked for this
 }
 void testRestart() {
     auto m = readyModel();
@@ -563,7 +625,7 @@ void testFailuresAndRecovery() {
     fx = step(manual, EventType::DisplayNotFound);
     CHECK(!has(fx, EffectType::StartDisplay));
     CHECK(manual.phase == Phase::Idle);
-    // BrowserMon exists but is primary: no engine start, actionable problem shown.
+    // LaptopMon exists but is primary: no engine start, actionable problem shown.
     AppModel p;
     p.setupReady = true;
     step(p, EventType::Init);
@@ -579,6 +641,14 @@ void testSettings() {
     CHECK(defaults.signalingUrl == std::string(kDefaultSignalingUrl));
     CHECK(defaults.fps == 60);
     CHECK(defaults.backend == CaptureBackend::Auto);
+    // The virtual display ships scaled like the 13.3" panel its EDID describes.
+    CHECK(defaults.displayScale == DisplayScale::Percent150);
+    CHECK(scalePercent(defaults.displayScale) == 150);
+    CHECK(scalePercent(DisplayScale::Recommended) == 0);
+    for (auto v : {DisplayScale::Recommended, DisplayScale::Percent100, DisplayScale::Percent125,
+                   DisplayScale::Percent150, DisplayScale::Percent175})
+        CHECK(scaleFromName(scaleName(v)) == v);
+    CHECK(scaleFromName("133") == DisplayScale::Recommended); // Anything unknown means "leave it to Windows"
     // Round trip preserves every field.
     Settings s;
     s.startAtSignIn = true;
@@ -588,6 +658,7 @@ void testSettings() {
     s.backend = CaptureBackend::Dxgi;
     s.fps = 30;
     s.quality = QualityPreset::Quality;
+    s.displayScale = DisplayScale::Percent125;
     s.signalingUrl = "https://example.invalid/signaling";
     CHECK(settingsFromJson(toJson(s)) == s);
     // Tolerant parsing: garbage and unknown keys fall back to defaults instead of failing.
@@ -595,7 +666,12 @@ void testSettings() {
     CHECK(parsed.fps == 60);
     CHECK(parsed.backend == CaptureBackend::Auto);
     CHECK(parsed.quality == QualityPreset::Balanced);
+    CHECK(parsed.displayScale == DisplayScale::Percent150);
     CHECK(parsed.signalingUrl == std::string(kDefaultSignalingUrl));
+    // A settings file written before scaling existed keeps the new default rather than silently meaning 100%.
+    CHECK(settingsFromJson(nlohmann::json::parse(R"({"fps":30})")).displayScale == DisplayScale::Percent150);
+    CHECK(settingsFromJson(nlohmann::json::parse(R"({"displayScale":"recommended"})")).displayScale ==
+          DisplayScale::Recommended);
     CHECK(settingsFromJson(nlohmann::json::array()) == Settings{});
     CHECK(settingsFromJson(nlohmann::json::parse(R"({"fps":45})")).fps == 60);
     CHECK(settingsFromJson(nlohmann::json::parse(R"({"fps":20})")).fps == 30);
@@ -606,7 +682,7 @@ void testSettings() {
     CHECK(bitratePlan(QualityPreset::Balanced).initial == 8000000);
     CHECK(bitratePlan(QualityPreset::Quality).maximum > bitratePlan(QualityPreset::Efficient).maximum);
     // Persistence through the store, including a missing file, a corrupt file and overwrite.
-    auto dir = std::filesystem::temp_directory_path() / ("bm-settings-test-" + std::to_string(std::rand()));
+    auto dir = std::filesystem::temp_directory_path() / ("lm-settings-test-" + std::to_string(std::rand()));
     SettingsStore store(dir / "nested" / "settings.json");
     CHECK(store.load() == Settings{});
     store.save(s);
@@ -633,6 +709,7 @@ int main() {
     testSetupRequired();
     testStopStreamingAndRepeatedStops();
     testStopMonitor();
+    testRepeatedMonitorCycles();
     testRestart();
     testExit();
     testFailuresAndRecovery();

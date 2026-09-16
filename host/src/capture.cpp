@@ -1,6 +1,6 @@
 #include "platform.hpp"
 #include <d3d10.h>
-namespace bm {
+namespace lm {
 std::vector<Display> displays() {
     ComPtr<IDXGIFactory1> factory;
     check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
@@ -88,4 +88,4 @@ class Duplication final : public ICapture {
 std::unique_ptr<ICapture> duplication(Device &d, const Display &s) {
     return std::make_unique<Duplication>(d, s);
 }
-} // namespace bm
+} // namespace lm

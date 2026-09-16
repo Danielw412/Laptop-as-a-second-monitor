@@ -4,7 +4,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
-namespace bm {
+namespace lm {
 enum class LogLevel { Debug, Info, Warning, Error };
 class Log {
   public:
@@ -38,4 +38,4 @@ inline void logWarning(std::string_view m) {
 inline void logError(std::string_view m) {
     Log::instance().write(LogLevel::Error, m);
 }
-} // namespace bm
+} // namespace lm

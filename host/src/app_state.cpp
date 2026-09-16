@@ -1,5 +1,5 @@
 #include "app_state.hpp"
-namespace bm {
+namespace lm {
 namespace {
 constexpr int kMaxDisplayRetries = 3;
 void emit(std::vector<Effect> &effects, EffectType type, std::string detail = {}) {
@@ -86,7 +86,7 @@ void continueStopChain(AppModel &m, std::vector<Effect> &effects) {
     if (m.stopDisplayPending && m.display == DisplayStatus::External) {
         // Not ours to remove; leave it and report.
         m.stopDisplayPending = false;
-        m.detail = "The virtual display is managed outside Browser Monitor and was left running.";
+        m.detail = "The virtual display is managed outside Laptop Monitor and was left running.";
     }
     m.stopDisplayPending = false;
     if (m.exiting) {
@@ -275,7 +275,7 @@ std::vector<Effect> reduce(AppModel &m, const Event &e) {
         if (m.display == DisplayStatus::Missing) {
             // We created it but it never became part of the desktop.
             m.display = DisplayStatus::Error;
-            m.error = e.detail.empty() ? "BrowserMon did not appear on the desktop." : e.detail;
+            m.error = e.detail.empty() ? "LaptopMon did not appear on the desktop." : e.detail;
             break;
         }
         if (m.wantDisplay && !m.restartPending)
@@ -290,7 +290,7 @@ std::vector<Effect> reduce(AppModel &m, const Event &e) {
     case EventType::DisplayLost:
         if (displayUsable(m)) {
             m.display = DisplayStatus::Missing;
-            m.detail = e.detail.empty() ? "BrowserMon disappeared; waiting for it to return." : e.detail;
+            m.detail = e.detail.empty() ? "LaptopMon disappeared; waiting for it to return." : e.detail;
         }
         break;
     case EventType::EngineStarted:
@@ -374,7 +374,7 @@ const char *phaseText(Phase p) {
     case Phase::StartingDisplay:
         return "Starting virtual display";
     case Phase::FindingDisplay:
-        return "Finding BrowserMon";
+        return "Finding LaptopMon";
     case Phase::DisplayOnly:
         return "Streaming stopped";
     case Phase::StartingEncoder:
@@ -469,4 +469,4 @@ const char *effectName(EffectType t) {
                                   "StopEngine",  "DisconnectViewer", "Quit",     "Notify"};
     return names[size_t(t)];
 }
-} // namespace bm
+} // namespace lm

@@ -7,11 +7,12 @@
 #include "pipeline.hpp"
 #include "settings.hpp"
 #include "setup.hpp"
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <windows.h>
-namespace bm::app {
+namespace lm::app {
 class AppController {
   public:
     AppController(HWND window, SettingsStore store, Settings settings, std::string hostSecret);
@@ -21,7 +22,7 @@ class AppController {
     void post(Event);
     /// UI thread: applies queued events.
     void drain();
-    /// UI thread: something about the desktop changed; look again if we are waiting for BrowserMon.
+    /// UI thread: something about the desktop changed; look again if we are waiting for LaptopMon.
     void displayChanged();
     void pollDisplay();
     // User actions (UI thread).
@@ -80,7 +81,8 @@ class AppController {
     SetupStatus setup_;
     DisplayController display_;
     std::unique_ptr<StreamingEngine> engine_;
-    uint64_t engineGeneration_ = 0;                          // Identifies which engine an event came from
+    // Identifies which engine an event came from: written on the UI thread, read on every engine thread.
+    std::atomic<uint64_t> engineGeneration_{0};
     std::vector<std::unique_ptr<StreamingEngine>> retired_; // Stopped engines awaiting join
     std::mutex queueMutex_;
     std::deque<Event> queue_;
@@ -93,13 +95,16 @@ class AppController {
     std::function<void()> stateCallback_;
     mutable std::mutex logMutex_;
     std::deque<std::string> log_;
+    bool scaleApplied_ = false; // Per display session: we set the scale once, then leave it to the user
     void dispatch(const Event &);
     void execute(const Effect &);
     void findDisplay();
+    /// Applies the configured Windows scaling to the virtual display only.
+    void applyScale(const DisplayTarget &, bool force);
     void startEngine();
     void stopEngine();
     void onEngineEvent(uint64_t generation, const EngineEvent &);
     void reapEngines();
     void launchElevatedAndWait(HWND owner, const wchar_t *argument);
 };
-} // namespace bm::app
+} // namespace lm::app

@@ -1,7 +1,7 @@
 #pragma once
 #include "platform.hpp"
 #include <d3d11_1.h>
-namespace bm {
+namespace lm {
 // Reproducible moving GPU rectangle on the explicitly selected monitor.
 class Pattern {
     HWND window_{};

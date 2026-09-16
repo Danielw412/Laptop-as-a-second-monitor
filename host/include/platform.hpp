@@ -17,7 +17,7 @@
 #include <vector>
 #include <windows.h>
 #include <wrl/client.h>
-namespace bm {
+namespace lm {
 using Microsoft::WRL::ComPtr;
 using Clock = std::chrono::steady_clock;
 inline int64_t now100ns() {
@@ -119,4 +119,4 @@ class IEncoder {
 };
 std::unique_ptr<IEncoder> hardwareEncoder(Device &, const Display &, unsigned width, unsigned height,
                                           unsigned fps, uint32_t bitrate = 8000000);
-} // namespace bm
+} // namespace lm

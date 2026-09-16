@@ -19,7 +19,7 @@
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
-    <Inf Include="BrowserMonitorIdd.inf" />
+    <Inf Include="LaptopMonitorIdd.inf" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{2D54CB75-8B17-4F11-97DC-847B0244CD46}</ProjectGuid>
@@ -28,7 +28,7 @@
     <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
     <Configuration>Debug</Configuration>
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
-    <RootNamespace>BrowserMonitorIdd</RootNamespace>
+    <RootNamespace>LaptopMonitorIdd</RootNamespace>
   </PropertyGroup>
   <PropertyGroup Label="PropertySheets">
     <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>

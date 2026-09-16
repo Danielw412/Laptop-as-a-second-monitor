@@ -7,7 +7,7 @@
 #include "settings.hpp"
 #include <functional>
 #include <nlohmann/json.hpp>
-namespace bm {
+namespace lm {
 enum class SignalingState { Disconnected, Connecting, Connected, Rejected };
 enum class TransportEventType {
     SignalingConnecting,
@@ -49,4 +49,4 @@ struct TransportTestOptions {
 std::unique_ptr<ITransport> webRtc(std::string server, std::string hostSecret,
                                    std::function<void(const TransportEvent &)> events = {},
                                    TransportTestOptions test = {}, BitratePlan plan = bitratePlan(QualityPreset::Balanced));
-} // namespace bm
+} // namespace lm

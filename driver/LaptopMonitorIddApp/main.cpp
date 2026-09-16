@@ -1,5 +1,5 @@
 // Derived from microsoft/Windows-driver-samples video/IndirectDisplay/IddSampleApp/main.cpp.
-// Creates the software device that loads BrowserMonitorIdd; the virtual monitor exists while this process runs.
+// Creates the software device that loads LaptopMonitorIdd; the virtual monitor exists while this process runs.
 
 #include <iostream>
 #include <vector>
@@ -39,12 +39,12 @@ int __cdecl main(int argc, wchar_t *argv[])
     CreationContext creation = { CreateEvent(nullptr, FALSE, FALSE, nullptr), E_PENDING };
     HSWDEVICE hSwDevice;
     SW_DEVICE_CREATE_INFO createInfo = { 0 };
-    PCWSTR description = L"Browser Monitor Virtual Display";
+    PCWSTR description = L"Laptop Monitor Virtual Display";
 
     // These match the Pnp id's in the inf file so OS will load the driver when the device is created
-    PCWSTR instanceId = L"BrowserMonitorIdd";
-    PCWSTR hardwareIds = L"BrowserMonitorIdd\0\0";
-    PCWSTR compatibleIds = L"BrowserMonitorIdd\0\0";
+    PCWSTR instanceId = L"LaptopMonitorIdd";
+    PCWSTR hardwareIds = L"LaptopMonitorIdd\0\0";
+    PCWSTR compatibleIds = L"LaptopMonitorIdd\0\0";
 
     createInfo.cbSize = sizeof(createInfo);
     createInfo.pszzCompatibleIds = compatibleIds;
@@ -57,7 +57,7 @@ int __cdecl main(int argc, wchar_t *argv[])
                                  SWDeviceCapabilitiesDriverRequired;
 
     // Create the device
-    HRESULT hr = SwDeviceCreate(L"BrowserMonitorIdd",
+    HRESULT hr = SwDeviceCreate(L"LaptopMonitorIdd",
                                 L"HTREE\\ROOT\\0",
                                 &createInfo,
                                 0,

@@ -8,7 +8,7 @@
 #include <rtc/plihandler.hpp>
 #include <rtc/rtc.hpp>
 #include <wincrypt.h>
-namespace bm {
+namespace lm {
 using Json = nlohmann::json;
 namespace {
 class TestPacketLoss final : public rtc::MediaHandler {
@@ -234,9 +234,9 @@ class Transport final : public ITransport {
         rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
         // Baseline, level 4.2 permits 1080p60. Packetization mode 1 supports FU-A fragmentation.
         video.addH264Codec(96, "profile-level-id=42002a;packetization-mode=1;level-asymmetry-allowed=1");
-        video.addSSRC(42, "browser-monitor", "display", "video");
+        video.addSSRC(42, "laptop-monitor", "display", "video");
         track_ = peer_->addTrack(video);
-        rtp_ = std::make_shared<rtc::RtpPacketizationConfig>(42u, "browser-monitor", uint8_t(96), 90000u);
+        rtp_ = std::make_shared<rtc::RtpPacketizationConfig>(42u, "laptop-monitor", uint8_t(96), 90000u);
         auto packetizer =
             std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, rtp_, 1200);
         packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(rtp_));
@@ -580,4 +580,4 @@ std::unique_ptr<ITransport> webRtc(std::string server, std::string hostSecret,
                                    BitratePlan plan) {
     return std::make_unique<Transport>(std::move(server), std::move(hostSecret), std::move(events), test, plan);
 }
-} // namespace bm
+} // namespace lm

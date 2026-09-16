@@ -1,1 +1,1 @@
-{"name":"@browser-monitor/viewer","private":true,"type":"module","scripts":{"dev":"vite --host 127.0.0.1","build":"vite build"},"devDependencies":{"vite":"^8.3.0"}}
+{"name":"@laptop-monitor/viewer","private":true,"type":"module","scripts":{"dev":"vite --host 127.0.0.1","build":"vite build"},"devDependencies":{"vite":"^8.3.0"}}

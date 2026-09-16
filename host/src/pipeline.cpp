@@ -4,7 +4,7 @@
 #include <d3d11_1.h>
 #include <fstream>
 #include <winrt/base.h>
-namespace bm {
+namespace lm {
 namespace {
 class PollTimer {
     HANDLE timer_ =
@@ -564,4 +564,4 @@ void StreamingEngine::loop() {
         }
     }
 }
-} // namespace bm
+} // namespace lm

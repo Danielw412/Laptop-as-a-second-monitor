@@ -8,7 +8,7 @@
 #include <bcrypt.h>
 #include <wincrypt.h>
 #endif
-namespace bm {
+namespace lm {
 BitratePlan bitratePlan(QualityPreset p) {
     switch (p) {
     case QualityPreset::Efficient:
@@ -48,6 +48,7 @@ nlohmann::json toJson(const Settings &s) {
             {"captureBackend", backendName(s.backend)},
             {"fps", s.fps},
             {"quality", qualityName(s.quality)},
+            {"displayScale", scaleName(s.displayScale)},
             {"signalingUrl", s.signalingUrl}};
 }
 Settings settingsFromJson(const nlohmann::json &j) {
@@ -74,6 +75,8 @@ Settings settingsFromJson(const nlohmann::json &j) {
                     : v == "quality" ? QualityPreset::Quality
                                      : QualityPreset::Balanced;
     }
+    if (j.contains("displayScale") && j["displayScale"].is_string())
+        s.displayScale = scaleFromName(j["displayScale"].get<std::string>());
     if (j.contains("signalingUrl") && j["signalingUrl"].is_string())
         s.signalingUrl = j["signalingUrl"].get<std::string>();
     return sanitized(s);
@@ -135,7 +138,7 @@ std::filesystem::path appDataDirectory() {
     auto size = GetEnvironmentVariableW(L"LOCALAPPDATA", value, DWORD(std::size(value)));
     if (!size || size >= std::size(value))
         throw std::runtime_error("LOCALAPPDATA unavailable");
-    return std::filesystem::path(value) / L"BrowserMonitor";
+    return std::filesystem::path(value) / L"LaptopMonitor";
 }
 std::filesystem::path settingsPath() {
     return appDataDirectory() / L"settings.json";
@@ -156,7 +159,7 @@ std::string generateSecret() {
 void writeProtected(const std::filesystem::path &path, const std::string &plain) {
     std::string copy = plain;
     DATA_BLOB input{DWORD(copy.size()), reinterpret_cast<BYTE *>(copy.data())}, output{};
-    if (!CryptProtectData(&input, L"Browser Monitor host credential", nullptr, nullptr, nullptr,
+    if (!CryptProtectData(&input, L"Laptop Monitor host credential", nullptr, nullptr, nullptr,
                           CRYPTPROTECT_UI_FORBIDDEN, &output))
         throw std::runtime_error("Cannot protect the host credential");
     SecureZeroMemory(copy.data(), copy.size());
@@ -193,4 +196,4 @@ std::string loadOrCreateHostSecret(const std::filesystem::path &path) {
     return secret;
 }
 #endif
-} // namespace bm
+} // namespace lm

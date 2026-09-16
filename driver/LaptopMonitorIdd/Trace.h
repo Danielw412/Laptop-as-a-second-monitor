@@ -58,4 +58,4 @@ Environment:
 // Driver specific #defines
 //
 
-#define MYDRIVER_TRACING_ID L"BrowserMonitor\\UMDF2.25\\BrowserMonitorIdd v1.0"
+#define MYDRIVER_TRACING_ID L"LaptopMonitor\\UMDF2.25\\LaptopMonitorIdd v1.0"

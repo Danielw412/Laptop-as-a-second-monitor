@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-namespace bm {
+namespace lm {
 struct PairingSnapshot {
     std::string code;                                 // Current code to show
     std::chrono::steady_clock::time_point rotatesAt{}; // When it will change
@@ -38,4 +38,4 @@ struct MetricsSnapshot {
     PairingSnapshot pairing;
     std::chrono::steady_clock::time_point updated{};
 };
-} // namespace bm
+} // namespace lm

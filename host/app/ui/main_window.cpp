@@ -5,7 +5,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <windowsx.h>
-namespace bm::app::ui {
+namespace lm::app::ui {
 namespace {
 constexpr float kMargin = 24.f;
 constexpr float kRight = 440.f - kMargin;
@@ -84,7 +84,7 @@ MainWindow::MainWindow(HINSTANCE instance, bool startHidden, SettingsStore store
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     RECT rc{0, 0, LONG(kWidth * dpi_ / 96), LONG(kHeight * dpi_ / 96)};
     AdjustWindowRectExForDpi(&rc, style, FALSE, 0, UINT(dpi_));
-    hwnd_ = CreateWindowExW(0, kWindowClass, L"Browser Monitor", style, CW_USEDEFAULT, CW_USEDEFAULT,
+    hwnd_ = CreateWindowExW(0, kWindowClass, L"Laptop Monitor", style, CW_USEDEFAULT, CW_USEDEFAULT,
                             rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, instance, this);
     if (!hwnd_)
         throw std::runtime_error("Cannot create the main window");
@@ -95,9 +95,9 @@ MainWindow::MainWindow(HINSTANCE instance, bool startHidden, SettingsStore store
     controller_ = std::make_unique<AppController>(hwnd_, std::move(store), std::move(settings), std::move(hostSecret));
     controller_->stateChanged([this] { onStateChanged(); });
     controller_->viewerConnectedChanged([this](bool on) {
-        tray_.balloon(L"Browser Monitor", on ? L"Receiver connected." : L"Receiver disconnected.");
+        tray_.balloon(L"Laptop Monitor", on ? L"Receiver connected." : L"Receiver disconnected.");
     });
-    tray_.add(hwnd_, WM_APP_TRAY, icons_[5], L"Browser Monitor");
+    tray_.add(hwnd_, WM_APP_TRAY, icons_[5], L"Laptop Monitor");
     SetTimer(hwnd_, TIMER_UI, 1000, nullptr);
     SetTimer(hwnd_, TIMER_METRICS, 500, nullptr);
     syncUrlEdit();
@@ -186,7 +186,7 @@ LRESULT CALLBACK MainWindow::windowProc(HWND hwnd, UINT message, WPARAM w, LPARA
 }
 LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
     if (message == taskbarCreated_ && taskbarCreated_) {
-        tray_.add(hwnd_, WM_APP_TRAY, icons_[5], L"Browser Monitor");
+        tray_.add(hwnd_, WM_APP_TRAY, icons_[5], L"Laptop Monitor");
         lastIcon_ = -1;
         updateTray();
         return 0;
@@ -290,8 +290,12 @@ LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
             toast_.clear();
             InvalidateRect(hwnd_, nullptr, FALSE);
         } else if (w == TIMER_EXIT) {
-            logWarning("Exit is taking too long; closing anyway");
-            DestroyWindow(hwnd_);
+            KillTimer(hwnd_, TIMER_EXIT);
+            if (!destroying_) {
+                logWarning("Exit is taking too long; closing anyway");
+                destroying_ = true;
+                DestroyWindow(hwnd_);
+            }
         }
         return 0;
     case WM_DISPLAYCHANGE:
@@ -309,8 +313,11 @@ LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
         return 0;
     case WM_APP_SETUP_DONE:
         controller_->setupProcessFinished(int(w));
-        if (controller_->quitRequested())
+        if (controller_->quitRequested() && !destroying_) {
+            destroying_ = true;
             DestroyWindow(hwnd_);
+            return 0;
+        }
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     case WM_COMMAND:
@@ -330,9 +337,11 @@ LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
             controller_->exitApp();
         return 0;
     case WM_DESTROY:
+        destroying_ = true;
         KillTimer(hwnd_, TIMER_UI);
         KillTimer(hwnd_, TIMER_METRICS);
         KillTimer(hwnd_, TIMER_FIND);
+        KillTimer(hwnd_, TIMER_EXIT);
         tray_.remove();
         PostQuitMessage(0);
         return 0;
@@ -341,7 +350,12 @@ LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
 }
 void MainWindow::onStateChanged() {
     if (controller_->quitRequested()) {
-        DestroyWindow(hwnd_);
+        // This runs inside controller_->drain(): the window is torn down once, and the remaining events of that
+        // drain must not paint, re-arm timers or try to destroy it again.
+        if (!destroying_) {
+            destroying_ = true;
+            DestroyWindow(hwnd_);
+        }
         return;
     }
     if (controller_->model().exiting && !exitTimerArmed_) {
@@ -384,7 +398,7 @@ void MainWindow::updateTray() {
         icon = 3;
         break;
     }
-    std::wstring tip = L"Browser Monitor · " + widen(phaseText(m.phase));
+    std::wstring tip = L"Laptop Monitor · " + widen(phaseText(m.phase));
     if (icon != lastIcon_ || tip != lastTip_) {
         lastIcon_ = icon;
         lastTip_ = tip;
@@ -410,7 +424,7 @@ void MainWindow::onTray(WPARAM, LPARAM l) {
 void MainWindow::trayMenu() {
     const auto &m = controller_->model();
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, L"Open Browser Monitor");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, L"Open Laptop Monitor");
     SetMenuDefaultItem(menu, IDM_TRAY_OPEN, FALSE);
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     const auto code = controller_->pairingCode();
@@ -427,7 +441,7 @@ void MainWindow::trayMenu() {
                                                                                           : L"Stop monitor");
     AppendMenuW(menu, MF_STRING | (m.exiting ? MF_GRAYED : 0), IDM_TRAY_RESTART, L"Restart");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"Exit Browser Monitor");
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"Exit Laptop Monitor");
     POINT point;
     GetCursorPos(&point);
     SetForegroundWindow(hwnd_);
@@ -485,7 +499,7 @@ void MainWindow::copyCode() {
 void MainWindow::copyDiagnostics() {
     const auto &m = controller_->model();
     const auto &s = metrics_;
-    std::string text = "Browser Monitor " BM_VERSION "\n";
+    std::string text = "Laptop Monitor " LM_VERSION "\n";
     text += std::string("State: ") + phaseText(m.phase) + " | display " + displayText(m.display) + " | stream " +
             streamText(m.stream) + " | receiver " + viewerText(m.viewer) + " | signaling " +
             signalingText(m.signaling) + "\n";
@@ -548,6 +562,12 @@ void MainWindow::chooseSetting(Id id, const D2D1_RECT_F &anchor) {
     } else if (id == Id::SetFps) {
         item(1, L"60 fps", settings.fps == 60);
         item(2, L"30 fps", settings.fps == 30);
+    } else if (id == Id::SetScale) {
+        item(1, L"Recommended (from the monitor's size)", settings.displayScale == DisplayScale::Recommended);
+        item(2, L"100%", settings.displayScale == DisplayScale::Percent100);
+        item(3, L"125%", settings.displayScale == DisplayScale::Percent125);
+        item(4, L"150% (like a 13\" laptop)", settings.displayScale == DisplayScale::Percent150);
+        item(5, L"175%", settings.displayScale == DisplayScale::Percent175);
     } else {
         item(1, L"Efficient (5 Mbps start, 10 Mbps max)", settings.quality == QualityPreset::Efficient);
         item(2, L"Balanced (8 Mbps start, 16 Mbps max)", settings.quality == QualityPreset::Balanced);
@@ -565,6 +585,12 @@ void MainWindow::chooseSetting(Id id, const D2D1_RECT_F &anchor) {
         settings.backend = command == 1 ? CaptureBackend::Auto : command == 2 ? CaptureBackend::Wgc : CaptureBackend::Dxgi;
     else if (id == Id::SetFps)
         settings.fps = command == 1 ? 60 : 30;
+    else if (id == Id::SetScale)
+        settings.displayScale = command == 1   ? DisplayScale::Recommended
+                                : command == 2 ? DisplayScale::Percent100
+                                : command == 3 ? DisplayScale::Percent125
+                                : command == 4 ? DisplayScale::Percent150
+                                               : DisplayScale::Percent175;
     else
         settings.quality = command == 1   ? QualityPreset::Efficient
                            : command == 2 ? QualityPreset::Balanced
@@ -617,9 +643,9 @@ void MainWindow::activate(Id id) {
     case Id::Uninstall:
         if (MessageBoxW(hwnd_,
                         L"This removes the virtual display driver, the display helper, the scheduled task, "
-                        L"start-at-sign-in and all Browser Monitor data on this PC. Browser Monitor exits afterwards.\n\n"
+                        L"start-at-sign-in and all Laptop Monitor data on this PC. Laptop Monitor exits afterwards.\n\n"
                         L"Windows will ask for administrator approval.",
-                        L"Uninstall Browser Monitor", MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON2) == IDOK)
+                        L"Uninstall Laptop Monitor", MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON2) == IDOK)
             controller_->runUninstall(hwnd_);
         break;
     case Id::OpenLogs: {
@@ -653,6 +679,7 @@ void MainWindow::activate(Id id) {
     case Id::SetBackend:
     case Id::SetFps:
     case Id::SetQuality:
+    case Id::SetScale:
         chooseSetting(id, anchor);
         break;
     case Id::ResetUrl:
@@ -723,7 +750,7 @@ void MainWindow::paint() {
 void MainWindow::drawHeader() {
     const auto &t = renderer_.theme();
     const auto &m = controller_->model();
-    renderer_.text(L"Browser Monitor", rect(kMargin, 14, 240, 30), Font::Title, t.text);
+    renderer_.text(L"Laptop Monitor", rect(kMargin, 14, 240, 30), Font::Title, t.text);
     // State pill.
     D2D1_COLOR_F dot = t.neutral;
     switch (m.phase) {
@@ -905,7 +932,7 @@ void MainWindow::drawOverview() {
             break;
         case Phase::DisplayOnly:
             title = L"Streaming stopped";
-            detail = m.detail.empty() ? L"BrowserMon stays available as a desktop extension." : widen(m.detail);
+            detail = m.detail.empty() ? L"LaptopMon stays available as a desktop extension." : widen(m.detail);
             action = Id::ToggleStream;
             actionLabel = L"Start streaming";
             break;
@@ -924,7 +951,7 @@ void MainWindow::drawOverview() {
             title = widen(phaseText(m.phase)) + L"…";
             detail = widen(!m.detail.empty() && m.detail != "reconnect" ? m.detail
                            : m.phase == Phase::StartingDisplay      ? "Starting the elevated display helper."
-                           : m.phase == Phase::FindingDisplay       ? "Waiting for BrowserMon to join the desktop."
+                           : m.phase == Phase::FindingDisplay       ? "Waiting for LaptopMon to join the desktop."
                            : m.phase == Phase::StartingEncoder      ? "Preparing GPU capture and the hardware encoder."
                            : m.phase == Phase::ConnectingSignaling  ? "Reaching the signaling service."
                            : m.phase == Phase::Reconnecting         ? "Restoring the connection."
@@ -953,7 +980,7 @@ void MainWindow::drawOverview() {
     };
     std::wstring displayValue = widen(displayText(m.display));
     if (m.display == DisplayStatus::Active || m.display == DisplayStatus::External)
-        displayValue = m.display == DisplayStatus::External ? L"BrowserMon · started elsewhere" : L"BrowserMon · 1920×1080 @ 60";
+        displayValue = m.display == DisplayStatus::External ? L"LaptopMon · started elsewhere" : L"LaptopMon · 1920×1080 @ 60";
     std::wstring streamValue = widen(streamText(m.stream));
     if (m.stream == StreamStatus::Streaming && s.width)
         streamValue = std::to_wstring(s.width) + L"×" + std::to_wstring(s.height) + L" · " + std::to_wstring(s.fps) +
@@ -1034,7 +1061,7 @@ void MainWindow::drawOverview() {
     add(Id::ToggleMonitor, rect(kMargin, by + 42, bw, 34), monitorOff ? L"Start monitor" : L"Stop monitor",
         Kind::Button, !exiting && (monitorOff ? m.setupReady : m.display != DisplayStatus::Stopping));
     add(Id::Restart, rect(kMargin + bw + 8, by + 42, bw, 34), L"Restart", Kind::Button, !exiting);
-    add(Id::Exit, rect(kMargin + 96, by + 86, kInner - 192, 26), L"Exit Browser Monitor", Kind::Ghost, !exiting);
+    add(Id::Exit, rect(kMargin + 96, by + 86, kInner - 192, 26), L"Exit Laptop Monitor", Kind::Ghost, !exiting);
 }
 void MainWindow::drawDetails() {
     const auto &t = renderer_.theme();
@@ -1115,17 +1142,21 @@ void MainWindow::drawSettings() {
         y += 36;
     };
     caption(L"GENERAL");
-    toggle(Id::SetStartAtSignIn, L"Start Browser Monitor at sign-in", settings.startAtSignIn);
+    toggle(Id::SetStartAtSignIn, L"Start Laptop Monitor at sign-in", settings.startAtSignIn);
     toggle(Id::SetAutoStart, L"Start the virtual display automatically", settings.autoStartDisplay);
     toggle(Id::SetMinimize, L"Keep running in the tray when the window closes", settings.minimizeToTray);
     toggle(Id::SetLog, L"Write a diagnostics log", settings.diagnosticsLog);
     y += 6;
-    caption(L"STREAMING");
+    caption(L"DISPLAY AND STREAMING");
     auto choice = [&](Id id, const wchar_t *label, std::wstring value) {
         auto &c = add(id, rect(kMargin, y, kInner, 34), label, Kind::Choice);
         c.value = std::move(value);
         y += 40;
     };
+    // Scaling applies to the virtual display alone, which is what the label has to make obvious.
+    choice(Id::SetScale, L"Windows scaling (this display only)",
+           settings.displayScale == DisplayScale::Recommended ? L"Recommended"
+                                                              : widen(scaleName(settings.displayScale)) + L"%");
     choice(Id::SetBackend, L"Capture backend",
            settings.backend == CaptureBackend::Auto ? L"Auto" : settings.backend == CaptureBackend::Wgc ? L"WGC" : L"DXGI");
     choice(Id::SetFps, L"Frame rate", std::to_wstring(settings.fps) + L" fps");
@@ -1157,9 +1188,9 @@ void MainWindow::drawSettings() {
     add(Id::Setup, rect(kMargin, y, 150, 32), setup.ready() ? L"Repair setup…" : L"Set up…", Kind::Primary, !busy);
     add(Id::Uninstall, rect(kMargin + 158, y, 150, 32), L"Uninstall…", Kind::Danger, !busy);
     y += 40;
-    std::wstring footer = L"Browser Monitor " BM_VERSION L" · log: " + Log::instance().path().wstring();
+    std::wstring footer = L"Laptop Monitor " LM_VERSION L" · log: " + Log::instance().path().wstring();
     if (Log::instance().path().empty())
-        footer = L"Browser Monitor " BM_VERSION L" · diagnostics log off";
+        footer = L"Laptop Monitor " LM_VERSION L" · diagnostics log off";
     renderer_.text(footer, rect(kMargin, kHeight - 30, kInner, 16), Font::Small, t.textFaint);
 }
-} // namespace bm::app::ui
+} // namespace lm::app::ui

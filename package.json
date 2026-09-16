@@ -1,5 +1,5 @@
 {
-  "name": "browser-monitor",
+  "name": "laptop-monitor",
   "private": true,
   "type": "module",
   "workspaces": [

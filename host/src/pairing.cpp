@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
-namespace bm {
+namespace lm {
 std::string PairingCodes::generate(const Rng &rng) {
     uint8_t bytes[kCodeLength];
     rng(bytes, sizeof bytes);
@@ -79,4 +79,4 @@ std::vector<CodeRegistration> PairingCodes::registrations(TimePoint now) const {
     add(current_);
     return out;
 }
-} // namespace bm
+} // namespace lm

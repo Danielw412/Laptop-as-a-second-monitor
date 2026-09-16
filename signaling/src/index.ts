@@ -329,7 +329,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/health")
       return Response.json({
-        service: "Browser Monitor signaling",
+        service: "Laptop Monitor signaling",
         version: 2,
         mediaRelay: false,
       });

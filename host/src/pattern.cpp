@@ -1,8 +1,8 @@
 #include "pattern.hpp"
-namespace bm {
+namespace lm {
 Pattern::Pattern(Device& device,const Display& display):width_(display.rect.right-display.rect.left),height_(display.rect.bottom-display.rect.top){
-    WNDCLASSW wc{};wc.lpfnWndProc=DefWindowProcW;wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"BrowserMonitorBenchmark";RegisterClassW(&wc);
-    window_=CreateWindowExW(WS_EX_NOACTIVATE,wc.lpszClassName,L"Browser Monitor benchmark",WS_POPUP|WS_VISIBLE,display.rect.left,display.rect.top,width_,height_,nullptr,nullptr,wc.hInstance,nullptr);
+    WNDCLASSW wc{};wc.lpfnWndProc=DefWindowProcW;wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"LaptopMonitorBenchmark";RegisterClassW(&wc);
+    window_=CreateWindowExW(WS_EX_NOACTIVATE,wc.lpszClassName,L"Laptop Monitor benchmark",WS_POPUP|WS_VISIBLE,display.rect.left,display.rect.top,width_,height_,nullptr,nullptr,wc.hInstance,nullptr);
     if(!window_)throw std::runtime_error("Create benchmark window failed");
     ComPtr<IDXGIFactory2> factory;check(display.adapter->GetParent(IID_PPV_ARGS(&factory)),"Pattern DXGI factory");
     DXGI_SWAP_CHAIN_DESC1 desc{};desc.Width=width_;desc.Height=height_;desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;desc.SampleDesc.Count=1;desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.BufferCount=2;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;

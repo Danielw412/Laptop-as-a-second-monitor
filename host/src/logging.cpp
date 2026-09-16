@@ -5,7 +5,7 @@
 #include <iostream>
 #include <mutex>
 #include <system_error>
-namespace bm {
+namespace lm {
 struct Log::Impl {
     std::mutex mutex;
     std::ofstream file;
@@ -73,4 +73,4 @@ void Log::write(LogLevel level, std::string_view message) {
     if (impl_->sink)
         impl_->sink(level, line);
 }
-} // namespace bm
+} // namespace lm
