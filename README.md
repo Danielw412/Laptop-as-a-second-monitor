@@ -194,6 +194,7 @@ host/tests                core-tests (bitrate, samples, H.264 framing), logic-te
                           settings, SHA-256)
 shared/protocol.ts        signaling message schema shared by worker and receiver
 signaling/, viewer/       Cloudflare Worker and receiver page
+docs/                     logging-reference.md: what every logged field means, for performance work
 tests/                    vitest (protocol, telemetry) and the signaling integration test
 ```
 
@@ -247,7 +248,11 @@ channels, both governed by the *diagnostics log* setting and neither ever contai
   telemetry. This is the file to read when the question is "where is the CPU, GPU or memory going".
 
 The per-second record is the same object the benchmark writes to its CSV and JSON sink, so a field measured in
-`benchmarks/` means the same thing in a user's log.
+`benchmarks/` means the same thing in a user's log. `perf.jsonl` is written while the streaming engine runs; it
+does not need a connected receiver, so a stream waiting for one still records what idling costs.
+
+**Every field, what a healthy value looks like and what a bad one points at: [`docs/logging-reference.md`](docs/logging-reference.md).**
+Read that before instrumenting anything new.
 
 #### Picture quality episodes
 
