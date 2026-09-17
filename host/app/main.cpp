@@ -5,6 +5,7 @@
 //   LaptopMonitor.exe --uninstall    elevated removal of everything setup created
 #include "app.hpp"
 #include "logging.hpp"
+#include "resources.hpp"
 #include "settings.hpp"
 #include "setup.hpp"
 #include "ui/main_window.hpp"
@@ -24,6 +25,7 @@ void activateExisting() {
 }
 } // namespace
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    const auto launched = Clock::now();
     int argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool background = false, setup = false, uninstall = false;
@@ -55,14 +57,34 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     try {
         SettingsStore store(settingsPath());
         Settings settings = store.load();
-        if (settings.diagnosticsLog)
+        if (settings.diagnosticsLog) {
             Log::instance().openFile(logDirectory());
+            Log::instance().openRecordFile(logDirectory());
+        }
+        auto elapsed = [&launched] {
+            return std::to_string(
+                int(std::chrono::duration<double, std::milli>(Clock::now() - launched).count()));
+        };
         logInfo("Laptop Monitor " LM_VERSION " starting");
+        logInfo(machineProfile());
+        // Every later measurement is relative to this machine and these settings; without them a log is a list of
+        // numbers with nothing to compare against.
+        logInfo(std::string("Settings: ") + std::to_string(settings.fps) + " fps | quality " +
+                qualityName(settings.quality) + " | capture " + backendName(settings.backend) + " | scale " +
+                std::to_string(scalePercent(settings.displayScale)) + "% | start at sign-in " +
+                (settings.startAtSignIn ? "on" : "off") + " | auto-start display " +
+                (settings.autoStartDisplay ? "on" : "off") + " | signaling " + settings.signalingUrl);
+        if (settings.diagnosticsLog)
+            logInfo("Diagnostics: " + Log::instance().path().string() + " and " +
+                    Log::instance().recordPath().string() + " (one performance sample per second)");
         // Keep the registry in step with the setting in case the executable moved.
         if (settings.startAtSignIn)
             setStartAtSignIn(true);
         std::string secret = loadOrCreateHostSecret(credentialPath());
+        logInfo("Startup: settings and credential ready " + elapsed() + " ms after launch");
         ui::MainWindow window(instance, background, std::move(store), std::move(settings), std::move(secret));
+        logInfo("Startup: window ready " + elapsed() + " ms after launch" +
+                (background ? " (started hidden in the tray)" : ""));
         code = window.run();
         logInfo("Laptop Monitor exited");
     } catch (const std::exception &e) {

@@ -35,6 +35,36 @@ export type DelayCounters = {
   decoded?: number;
   freezes?: number;
 };
+/** Cumulative picture-quality counters from inbound-rtp. */
+export type QualityCounters = {
+  qpSum?: number;
+  decoded?: number;
+  received?: number;
+  pli?: number;
+  nack?: number;
+  keyFrames?: number;
+};
+/**
+ * Quality over the interval: the mean quantizer the decoder saw (pixelation), and how many frames arrived but
+ * never decoded (loss). Returns nulls rather than zeros where a counter is unavailable, so the host's log never
+ * shows a clean picture that was really a missing statistic.
+ */
+export function intervalQuality(current: QualityCounters, previous?: QualityCounters) {
+  const difference = (a: number | undefined, b: number | undefined) =>
+    a === undefined || b === undefined ? null : Math.max(0, a - b);
+  if (!previous) return { qp: null, corrupted: null, pli: null, nack: null, keyFramesDecoded: null };
+  const frames = difference(current.decoded, previous.decoded);
+  const quantizer = difference(current.qpSum, previous.qpSum);
+  const received = difference(current.received, previous.received);
+  return {
+    qp: frames && quantizer !== null ? quantizer / frames : null,
+    // Frames the decoder was handed but never produced: the visible tearing and smearing.
+    corrupted: received === null || frames === null ? null : Math.max(0, received - frames),
+    pli: difference(current.pli, previous.pli),
+    nack: difference(current.nack, previous.nack),
+    keyFramesDecoded: difference(current.keyFrames, previous.keyFrames),
+  };
+}
 /** Per-frame receiver delays over the interval (ms), or null where a counter is unavailable. */
 export function intervalDelays(current: DelayCounters, previous?: DelayCounters) {
   if (!previous || current.time <= previous.time) return undefined;
@@ -53,6 +83,7 @@ export function intervalDelays(current: DelayCounters, previous?: DelayCounters)
 export class ReceiverStats {
   private previous?: Previous;
   private previousDelays?: DelayCounters;
+  private previousQuality?: QualityCounters;
   async sample(
     pc: RTCPeerConnection,
   ): Promise<
@@ -75,6 +106,9 @@ export class ReceiverStats {
       framesPerSecond?: number;
       totalProcessingDelay?: number;
       freezeCount?: number;
+      qpSum?: number;
+      framesReceived?: number;
+      keyFramesDecoded?: number;
     };
     const rttMs = pair?.currentRoundTripTime === undefined ? null : pair.currentRoundTripTime * 1000;
     const now = {
@@ -98,6 +132,16 @@ export class ReceiverStats {
     };
     const delays = intervalDelays(counters, this.previousDelays);
     this.previousDelays = counters;
+    const quality: QualityCounters = {
+      qpSum: v.qpSum,
+      decoded: v.framesDecoded,
+      received: v.framesReceived,
+      pli: v.pliCount,
+      nack: v.nackCount,
+      keyFrames: v.keyFramesDecoded,
+    };
+    const picture = intervalQuality(quality, this.previousQuality);
+    this.previousQuality = quality;
     const telemetry: Telemetry = {
       type: "telemetry",
       loss: delta && v.packetsReceived !== undefined && v.packetsLost !== undefined ? delta.loss : null,
@@ -111,6 +155,7 @@ export class ReceiverStats {
       decodeMs: delays?.decodeMs ?? null,
       processingMs: delays?.processingMs ?? null,
       freezes: delays?.freezes ?? null,
+      ...picture,
     };
     return {
       telemetry,

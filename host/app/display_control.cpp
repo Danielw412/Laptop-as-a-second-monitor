@@ -137,8 +137,15 @@ void DisplayController::start() {
     worker_ = std::thread([this, generation] { serve(generation); });
 }
 void DisplayController::serve(uint64_t generation) {
+    // Starting the virtual display is the longest wait in the whole app: a scheduled task has to launch an
+    // elevated process, which then creates a software device Windows has to enumerate. Timed in three parts so a
+    // slow start can be blamed on the right one.
+    const auto startedAt = GetTickCount64();
+    uint64_t taskLaunchedAt = 0, pipeConnectedAt = 0;
     auto giveUp = [&](std::string reason) {
         busy_ = false;
+        logWarning("Virtual display did not start after " + std::to_string(GetTickCount64() - startedAt) +
+                   " ms: " + reason);
         report({EventType::DisplayStartFailed, std::move(reason)});
     };
     std::wstring nonce;
@@ -154,6 +161,7 @@ void DisplayController::serve(uint64_t generation) {
         giveUp(narrow(error));
         return;
     }
+    taskLaunchedAt = GetTickCount64();
     // The helper creates the pipe once the task engine has launched it; that takes a moment.
     std::wstring pipeName = L"\\\\.\\pipe\\LaptopMonitor.Display." + nonce;
     HANDLE pipe = INVALID_HANDLE_VALUE;
@@ -174,6 +182,7 @@ void DisplayController::serve(uint64_t generation) {
                "repeated.");
         return;
     }
+    pipeConnectedAt = GetTickCount64();
     HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!event) {
         CloseHandle(pipe);
@@ -232,7 +241,12 @@ void DisplayController::serve(uint64_t generation) {
     }
     owned_ = true;
     busy_ = false;
-    logInfo("Virtual display device created (" + line.substr(6) + ")");
+    const auto readyAt = GetTickCount64();
+    logInfo("Virtual display device created (" + line.substr(6) + ") in " +
+            std::to_string(readyAt - startedAt) + " ms (scheduled task " +
+            std::to_string(taskLaunchedAt - startedAt) + " ms, helper pipe " +
+            std::to_string(pipeConnectedAt - taskLaunchedAt) + " ms, device " +
+            std::to_string(readyAt - pipeConnectedAt) + " ms)");
     report({EventType::DisplayStarted});
     // Watch the pipe until the helper leaves. stop() writes on this same pipe from the UI thread, which is why the
     // handle is overlapped; the short poll interval is what lets us notice an unconfirmed stop.

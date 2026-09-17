@@ -3,7 +3,9 @@
 #include "logging.hpp"
 #include "resources/resource.h"
 #include <commctrl.h>
+#include <iomanip>
 #include <shellapi.h>
+#include <sstream>
 #include <windowsx.h>
 namespace lm::app::ui {
 namespace {
@@ -98,6 +100,7 @@ MainWindow::MainWindow(HINSTANCE instance, bool startHidden, SettingsStore store
         tray_.balloon(L"Laptop Monitor", on ? L"Receiver connected." : L"Receiver disconnected.");
     });
     tray_.add(hwnd_, WM_APP_TRAY, icons_[5], L"Laptop Monitor");
+    uiResources_.sample(); // A CPU figure is a delta; without this the first report has nothing to subtract from.
     SetTimer(hwnd_, TIMER_UI, 1000, nullptr);
     SetTimer(hwnd_, TIMER_METRICS, 500, nullptr);
     syncUrlEdit();
@@ -283,6 +286,8 @@ LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
             metrics_ = controller_->metrics();
             if (IsWindowVisible(hwnd_) && page_ != Page::Settings)
                 InvalidateRect(hwnd_, nullptr, FALSE);
+            // On this timer rather than in paint(), so the cost of sitting in the tray is reported too.
+            reportUiCost();
         } else if (w == TIMER_FIND)
             controller_->pollDisplay();
         else if (w == TIMER_TOAST) {
@@ -511,7 +516,17 @@ void MainWindow::copyDiagnostics() {
             " | CPU readback: " + (s.cpuReadback ? "yes" : "no") + "\n";
     text += "Capture fps " + std::to_string(s.captureFps) + " | encode fps " + std::to_string(s.encodeFps) +
             " | dropped " + std::to_string(s.dropped) + " | bitrate " + std::to_string(s.bitrate) + "\n";
+    text += "Dropped: " + std::to_string(s.droppedCoalesced) + " coalesced, " +
+            std::to_string(s.droppedSuperseded) + " superseded, " + std::to_string(s.droppedRingBusy) +
+            " ring busy, " + std::to_string(s.droppedSubmitFailed) + " refused | paced " +
+            std::to_string(s.paced) + " | encoder rebuilds " + std::to_string(s.encoderRebuilds) + "\n";
+    text += "Engine thread: " + std::to_string(int(s.loopWakeupsPerSecond)) + " wake-ups/s, busy " +
+            std::to_string(int(s.loopBusyPercent)) + "%, longest " + std::to_string(int(s.loopMaxMs)) + " ms\n";
+    text += "Process: RAM " + std::to_string(s.workingSetMb) + " MB | GPU memory " +
+            std::to_string(s.gpuMemoryMb) + " MB | handles " + std::to_string(s.handles) + " | " +
+            (s.onBattery ? "on battery" : "on AC") + (s.batterySaver ? ", battery saver on" : "") + "\n";
     text += "Signaling " + s.signalingState + " | WebRTC " + s.webrtcState + "\n";
+    text += "Logs: " + Log::instance().path().string() + "\n";
     text += "Recent log (codes and credentials are never logged):\n";
     for (auto &line : controller_->recentLog())
         text += line + "\n";
@@ -720,7 +735,31 @@ MainWindow::Control &MainWindow::add(Id id, D2D1_RECT_F r, std::wstring label, K
     controls_.push_back({id, r, std::move(label), kind, enabled});
     return controls_.back();
 }
+void MainWindow::reportUiCost() {
+    const auto now = Clock::now();
+    if (now - paintReport_ < std::chrono::minutes(2))
+        return;
+    const auto seconds = std::chrono::duration<double>(now - paintReport_).count();
+    paintReport_ = now;
+    const auto usage = uiResources_.sample();
+    auto twoDecimals = [](double v) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(2) << v;
+        return out.str();
+    };
+    // Logged even with no paints at all: that line is the record of what the app costs while it sits in the tray,
+    // which is most of its life and the part nobody ever measures.
+    logInfo("App process: " + std::to_string(paints_) + " window paints in " + std::to_string(int(seconds)) +
+            " s (" + std::to_string(paintsHidden_) + " while hidden), mean " + twoDecimals(paintTimes_.mean()) +
+            " ms, longest " + twoDecimals(paintMaxMs_) + " ms | " + summarize(usage));
+    paints_ = paintsHidden_ = 0;
+    paintMaxMs_ = 0;
+}
 void MainWindow::paint() {
+    const auto paintStart = Clock::now();
+    ++paints_;
+    if (!IsWindowVisible(hwnd_))
+        ++paintsHidden_;
     PAINTSTRUCT ps;
     BeginPaint(hwnd_, &ps);
     if (renderer_.ensure(hwnd_)) {
@@ -746,6 +785,9 @@ void MainWindow::paint() {
             InvalidateRect(hwnd_, nullptr, FALSE);
     }
     EndPaint(hwnd_, &ps);
+    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - paintStart).count();
+    paintTimes_.add(ms);
+    paintMaxMs_ = std::max(paintMaxMs_, ms);
 }
 void MainWindow::drawHeader() {
     const auto &t = renderer_.theme();

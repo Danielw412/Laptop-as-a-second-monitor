@@ -1,12 +1,23 @@
 #include "pipeline.hpp"
 #include "logging.hpp"
 #include "pattern.hpp"
+#include "resources.hpp"
 #include <avrt.h>
 #include <d3d11_1.h>
 #include <fstream>
+#include <iomanip>
 #include <winrt/base.h>
 namespace lm {
 namespace {
+nlohmann::json optionalNumber(const std::optional<double> &v) {
+    return v ? nlohmann::json(*v) : nlohmann::json(nullptr);
+}
+/// Fixed-precision number for the readable log, where full double precision is only noise.
+std::string fixed(double value, int decimals = 1) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(decimals) << value;
+    return out.str();
+}
 class PollTimer {
     HANDLE timer_ =
         CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -26,25 +37,130 @@ class PollTimer {
         WaitForSingleObject(timer_, 100);
     }
 };
-class CpuMeter {
-    uint64_t previous_ = 0;
-    Clock::time_point time_ = Clock::now();
+// Why the engine thread woke up. Every wake-up costs a context switch, so knowing which ones did no useful work
+// is the first thing to look at when the process burns CPU while the desktop is still.
+enum class Wake { Frame, Encoder, Transport, Timeout };
+// Counts wake-ups by reason and how much of the wall clock the thread spent awake.
+struct LoopAccounting {
+    uint64_t frame = 0, encoder = 0, transport = 0, timeout = 0, idle = 0;
+    double busyMs = 0;
+    void woke(Wake reason) {
+        switch (reason) {
+        case Wake::Frame:
+            ++frame;
+            break;
+        case Wake::Encoder:
+            ++encoder;
+            break;
+        case Wake::Transport:
+            ++transport;
+            break;
+        case Wake::Timeout:
+            ++timeout;
+            break;
+        }
+    }
+    LoopAccounting operator-(const LoopAccounting &o) const {
+        return {frame - o.frame,       encoder - o.encoder, transport - o.transport,
+                timeout - o.timeout,   idle - o.idle,       busyMs - o.busyMs};
+    }
+};
+// Watches for the episode users describe as "it goes extremely pixelated and glitchy, then fixes itself", and
+// writes one line when it starts and one when it ends. Those are two different faults that look similar:
+//
+//   pixelation - the encoder was given too few bits for 1080p, so it raises the quantizer and the picture turns
+//                into blocks. Seen here as a collapse in encoded bits per frame, and at the receiver as a high
+//                quantizer. On this encoder a bitrate cut also means a full rebuild, which is a visible hitch.
+//   glitching  - packets were lost, so the decoder shows torn and smeared blocks until a keyframe repairs it.
+//                Seen as corrupted frames, freezes and keyframe requests at the receiver.
+//
+// Both usually end on their own, which is exactly why they need to be on record: by the time anyone looks, the
+// stream is fine again. Nothing here changes behaviour; it only reports.
+class QualityWatch {
+    static constexpr double kBlockyQp = 36;        // Above this the receiver's own decoder calls it blocky
+    static constexpr double kCollapseRatio = 0.55; // Encoded rate this far below normal is a visible drop
+    static constexpr int kRecoverySeconds = 3;     // Consecutive clean seconds before an episode is over
+    Samples<64> baseline_;                         // Encoded bits per second while the picture was healthy
+    bool inEpisode_ = false;
+    int clean_ = 0;
+    Clock::time_point started_{};
+    double worstQp_ = 0, lowestBitrate_ = 0;
+    uint64_t corrupted_ = 0, freezes_ = 0, keyframeRequests_ = 0;
+    uint32_t rebuilds_ = 0, rebuildsAtStart_ = 0;
+    uint64_t keyframeRequestsAtStart_ = 0;
+    std::string trigger_;
 
   public:
-    std::optional<double> sample() {
-        FILETIME creation{}, exit{}, kernel{}, user{};
-        if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user))
-            return std::nullopt;
-        auto ticks = [](FILETIME t) { return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
-        const auto total = ticks(kernel) + ticks(user);
-        const auto now = Clock::now();
-        const auto seconds = std::chrono::duration<double>(now - time_).count();
-        std::optional<double> result;
-        if (previous_ && seconds > 0)
-            result = (total - previous_) / 1e7 / seconds / GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) * 100;
-        previous_ = total;
-        time_ = now;
-        return result;
+    /// Called once a second with the snapshot that was just published, plus the session's rebuild count.
+    void update(const MetricsSnapshot &s, uint32_t encoderRebuilds) {
+        const double encodedBitsPerSecond = s.encodeFps * s.frameBytesMean * 8;
+        const bool haveBaseline = baseline_.count() >= 10;
+        const double normal = baseline_.mean();
+        std::string trigger;
+        if (s.viewerQp && *s.viewerQp > kBlockyQp)
+            trigger = "receiver quantizer " + fixed(*s.viewerQp, 0) + " (blocky)";
+        else if (haveBaseline && encodedBitsPerSecond > 0 && encodedBitsPerSecond < normal * kCollapseRatio)
+            trigger = "encoded rate fell to " + fixed(encodedBitsPerSecond / 1000000, 1) + " Mbps from a usual " +
+                      fixed(normal / 1000000, 1) + " Mbps";
+        else if (s.viewerCorrupted.value_or(0) > 0)
+            trigger = fixed(*s.viewerCorrupted, 0) + " frames arrived but never decoded";
+        else if (s.viewerFreezes.value_or(0) > 0)
+            trigger = fixed(*s.viewerFreezes, 0) + " freezes at the receiver";
+        if (trigger.empty() && encodedBitsPerSecond > 0 && !inEpisode_)
+            baseline_.add(encodedBitsPerSecond); // Only healthy seconds define what normal looks like
+        if (!inEpisode_ && trigger.empty())
+            return;
+        if (!inEpisode_) {
+            inEpisode_ = true;
+            clean_ = 0;
+            started_ = Clock::now();
+            trigger_ = trigger;
+            worstQp_ = s.viewerQp.value_or(0);
+            lowestBitrate_ = encodedBitsPerSecond;
+            corrupted_ = freezes_ = keyframeRequests_ = 0;
+            rebuilds_ = 0;
+            rebuildsAtStart_ = encoderRebuilds;
+            keyframeRequestsAtStart_ = s.keyframeRequests;
+            logWarning("Picture quality dropped: " + trigger + " | encoder " +
+                       std::to_string(s.bitrate / 1000) + " kbps (target " +
+                       std::to_string(s.targetBitrate / 1000) + ") | receiver " +
+                       (s.viewerFps ? fixed(*s.viewerFps, 0) : "-") + " fps, loss " +
+                       (s.loss ? fixed(*s.loss * 100, 2) + "%" : "-") + ", rtt " +
+                       (s.rttMs ? fixed(*s.rttMs, 0) + " ms" : "-") + " | host encode " + fixed(s.encodeFps, 0) +
+                       " fps, queue " + std::to_string(s.queueDepth));
+            return;
+        }
+        worstQp_ = std::max(worstQp_, s.viewerQp.value_or(0));
+        if (encodedBitsPerSecond > 0)
+            lowestBitrate_ = lowestBitrate_ > 0 ? std::min(lowestBitrate_, encodedBitsPerSecond) : encodedBitsPerSecond;
+        corrupted_ += uint64_t(s.viewerCorrupted.value_or(0));
+        freezes_ += uint64_t(s.viewerFreezes.value_or(0));
+        rebuilds_ = encoderRebuilds - rebuildsAtStart_;
+        keyframeRequests_ = s.keyframeRequests - keyframeRequestsAtStart_;
+        if (!trigger.empty()) {
+            clean_ = 0;
+            return;
+        }
+        if (++clean_ < kRecoverySeconds)
+            return;
+        inEpisode_ = false;
+        const auto seconds =
+            std::chrono::duration<double>(Clock::now() - started_).count() - kRecoverySeconds;
+        // Which of the two faults it was, named from what actually happened during the episode rather than from
+        // the one signal that tripped it.
+        std::string cause = "cause unclear";
+        if (rebuilds_)
+            cause = "encoder was recreated " + std::to_string(rebuilds_) +
+                    " time(s) at a lower bitrate: too few bits for this resolution";
+        else if (corrupted_ || freezes_ || keyframeRequests_)
+            cause = "packet loss: " + std::to_string(corrupted_) + " corrupted, " + std::to_string(freezes_) +
+                    " freezes, " + std::to_string(keyframeRequests_) + " keyframe requests";
+        else if (worstQp_ > kBlockyQp)
+            cause = "encoder raised the quantizer without a bitrate change: the desktop content got harder to "
+                    "encode";
+        logInfo("Picture quality recovered after " + fixed(seconds, 0) + " s (started: " + trigger_ +
+                ") | worst quantizer " + (worstQp_ > 0 ? fixed(worstQp_, 0) : "-") + ", lowest encoded rate " +
+                fixed(lowestBitrate_ / 1000000, 2) + " Mbps | " + cause);
     }
 };
 // Puts the engine thread into the multimedia scheduling class (MMCSS) for the lifetime of the loop, so a busy
@@ -73,9 +189,6 @@ class RealtimeScope {
         return task_ ? "MMCSS Capture" : "above-normal priority";
     }
 };
-nlohmann::json optionalNumber(const std::optional<double> &v) {
-    return v ? nlohmann::json(*v) : nlohmann::json(nullptr);
-}
 const char *modeName(PipelineMode m) {
     switch (m) {
     case PipelineMode::Capture:
@@ -210,10 +323,19 @@ void StreamingEngine::loop() {
     auto start = Clock::now();
     const int64_t epoch = now100ns();
     PollTimer pollTimer;
-    CpuMeter cpu;
-    cpu.sample();
+    ResourceMeter resources;
+    resources.sample();
     RealtimeScope realtime;
     logInfo(std::string("Streaming engine thread scheduling: ") + realtime.description());
+    // How often the readable log gets a performance line. The full sample goes to perf.jsonl every second; this
+    // is only so someone reading host.log can see what the stream was doing around an event.
+    constexpr auto kSummaryInterval = std::chrono::seconds(30);
+    auto lastSummary = Clock::now();
+    uint32_t encoderRebuilds = 0;
+    Samples<64> encoderRebuildTimes;
+    std::optional<Clock::time_point> encoderRebuildStart; // Set when a rebuild is requested, read when it lands
+    // Outlives a pipeline rebuild on purpose: a rebuild is usually part of the episode, not the end of it.
+    QualityWatch quality;
     uint32_t configuredBitrate = o.bitrate.initial;
     auto lastEncoderChange = Clock::now();
     bool hadDisplay = false, reportedMissing = false;
@@ -278,7 +400,14 @@ void StreamingEngine::loop() {
             }
             double scale = std::min({1.0, 1920.0 / iw, 1080.0 / ih});
             unsigned ow = unsigned(iw * scale) & ~1u, oh = unsigned(ih * scale) & ~1u;
+            // Stage timings for the build. A slow start is felt as "it takes a moment before my screen appears",
+            // and each stage has a different cause, so they are measured apart rather than as one total.
+            const auto buildStart = Clock::now();
+            auto sinceBuildStart = [&] {
+                return std::chrono::duration<double, std::milli>(Clock::now() - buildStart).count();
+            };
             Device device(selected);
+            const double deviceMs = sinceBuildStart();
             std::unique_ptr<Pattern> pattern;
             if (o.pattern)
                 pattern = std::make_unique<Pattern>(selected);
@@ -302,17 +431,37 @@ void StreamingEngine::loop() {
                     capture = used == CaptureBackend::Wgc ? wgc(device, selected) : duplication(device, selected);
                 resolved_ = used;
             }
+            const double captureMs = sinceBuildStart() - deviceMs;
             std::unique_ptr<Converter> converter;
             std::unique_ptr<IEncoder> encoder;
             if (o.mode != PipelineMode::Capture)
                 converter = std::make_unique<Converter>(device, iw, ih, ow, oh);
+            const double converterMs = sinceBuildStart() - deviceMs - captureMs;
             if (o.mode == PipelineMode::Encode || o.mode == PipelineMode::CaptureEncode || stream)
                 encoder = hardwareEncoder(device, selected, ow, oh, o.fps, configuredBitrate, kMaxInFlight);
+            const double encoderMs = sinceBuildStart() - deviceMs - captureMs - converterMs;
+            const double buildMs = sinceBuildStart();
+            const auto ready = Clock::now();
             const std::string backendLabel =
                 o.synthetic || o.mode == PipelineMode::Encode ? "Generated GPU source" : backendName(used);
             logInfo("Pipeline: " + backendLabel + " -> GPU NV12 -> " + (encoder ? encoder->name() : "benchmark") +
                     " | GPU " + selected.gpu + " | " + std::to_string(ow) + "x" + std::to_string(oh) + "@" +
                     std::to_string(o.fps) + " | CPU readback: no | mode " + modeName(o.mode));
+            // Where the wait before the first frame actually goes. The encoder stage dominates on most machines,
+            // which is why a bitrate change that recreates it is expensive rather than free.
+            logInfo("Pipeline built in " + fixed(buildMs) + " ms (device " + fixed(deviceMs) + ", capture " +
+                    fixed(captureMs) + ", NV12 converter " + fixed(converterMs) + ", encoder " + fixed(encoderMs) +
+                    ") at " + std::to_string(configuredBitrate) + " bps");
+            if (encoderRebuildStart) {
+                // The gap the receiver actually saw: from deciding to rebuild until the new pipeline is standing.
+                const double gap =
+                    std::chrono::duration<double, std::milli>(ready - *encoderRebuildStart).count();
+                encoderRebuildTimes.add(gap);
+                encoderRebuildStart.reset();
+                logInfo("Encoder rebuild interrupted the stream for " + fixed(gap) + " ms (mean " +
+                        fixed(encoderRebuildTimes.mean()) + " ms over " + std::to_string(encoderRebuilds) +
+                        " rebuilds)");
+            }
             emit(EngineEventType::EncoderReady, encoder ? encoder->name() : "");
             if (stream && !transport_)
                 transport_ = webRtc(o.signalingUrl, o.hostSecret, transportEvents, o.test, o.bitrate);
@@ -332,10 +481,16 @@ void StreamingEngine::loop() {
             }
             uint64_t captured = 0, encoded = 0, dropped = 0, noChange = 0, paced = 0, previousCaptured = 0,
                      previousEncoded = 0;
+            // Every drop has a different remedy: coalesced frames mean the loop is behind, a busy ring means the
+            // encoder is, a refused submit means the encoder is unhappy. Lumping them together hides all three.
+            uint64_t droppedCoalesced = 0, droppedSuperseded = 0, droppedRingBusy = 0, droppedSubmitFailed = 0;
             Samples<> capTimes, conversionTimes, encodeTimes, pipelineTimes, sizes, acquireDelays, sourceToEncoded,
                 sendTimes, submitIntervals;
+            Samples<256> keyframeSizes, deltaSizes, keyframeEncodeTimes, topologyCheckTimes;
+            LoopAccounting loop, previousLoop;
+            std::optional<double> firstEncodedMs, firstSentMs;
             uint64_t iterations = 0, previousIterations = 0, keyframes = 0;
-            double loopMaxMs = 0, sendMaxMs = 0, frameBytesMax = 0;
+            double loopMaxMs = 0, sendMaxMs = 0, frameBytesMax = 0, topologyCheckMaxMs = 0;
             std::optional<Clock::time_point> lastSubmit;
             bool sourceTimeWarned = false;
             uint32_t bitrate = configuredBitrate, attemptedBitrate = configuredBitrate;
@@ -371,6 +526,28 @@ void StreamingEngine::loop() {
                     device.context->Flush();
                 }
             }
+            // However this pipeline session ends - a stop, an encoder rebuild or a failure - it leaves one line
+            // with the totals, so the log can be read backwards from a complaint to the session that caused it.
+            struct SessionSummary {
+                std::function<void()> report;
+                ~SessionSummary() {
+                    report();
+                }
+            } sessionSummary{[&] {
+                const double seconds = std::chrono::duration<double>(Clock::now() - ready).count();
+                if (seconds < 1 || !captured)
+                    return;
+                logInfo("Pipeline session ended after " + fixed(seconds, 0) + " s: captured " +
+                        std::to_string(captured) + " (" + fixed(captured / seconds) + "/s), encoded " +
+                        std::to_string(encoded) + " (" + fixed(encoded / seconds) + "/s), dropped " +
+                        std::to_string(dropped) + ", paced " + std::to_string(paced) + ", keyframes " +
+                        std::to_string(keyframes) + " | encode mean " + fixed(encodeTimes.mean()) + " ms, p99 " +
+                        fixed(encodeTimes.percentile(.99)) + " ms | mean frame " +
+                        std::to_string(uint64_t(sizes.mean())) + " B | engine thread busy " +
+                        fixed(loop.busyMs / (seconds * 1000) * 100) + "% over " + std::to_string(iterations) +
+                        " wake-ups | first frame encoded " + (firstEncodedMs ? fixed(*firstEncodedMs) : "-") +
+                        " ms, sent " + (firstSentMs ? fixed(*firstSentMs) : "-") + " ms after build");
+            }};
             while (!stop_ && !timeUp()) {
                 // ---- Sleep until there is something to do: a frame, encoder news, a transport message, or the
                 // housekeeping deadline. Nothing here spins on a timer while connected.
@@ -378,6 +555,7 @@ void StreamingEngine::loop() {
                 const bool busy = encoder && (encoder->pending() || carried);
                 std::optional<Frame> frame;
                 bool fresh = false;
+                Wake wake = Wake::Timeout;
                 if (synthetic) {
                     auto now = Clock::now();
                     if (now < next) {
@@ -399,6 +577,7 @@ void StreamingEngine::loop() {
                         if (next < now)
                             next = now + period;
                         frame = Frame{synthetic, now100ns(), now100ns(), 1};
+                        wake = Wake::Frame;
                     }
                 } else if (capture && active && !capture->frameEvent()) {
                     // Desktop duplication has no event: block inside AcquireNextFrame, checking the encoder every
@@ -414,19 +593,32 @@ void StreamingEngine::loop() {
                             WaitForMultipleObjects(n, handles, FALSE, 1);
                     } else
                         frame = capture->acquire(busy ? 1 : 8);
+                    if (frame)
+                        wake = Wake::Frame;
                 } else {
+                    // The wait reasons are recorded in the same order the handles are added, so an idle desktop
+                    // can be told apart from one where the encoder or the transport keeps waking the thread.
                     HANDLE handles[3];
+                    Wake reasons[3];
                     DWORD n = 0;
-                    if (capture && active)
+                    if (capture && active) {
+                        reasons[n] = Wake::Frame;
                         handles[n++] = capture->frameEvent();
-                    if (encoder)
+                    }
+                    if (encoder) {
+                        reasons[n] = Wake::Encoder;
                         handles[n++] = encoder->event();
-                    if (transport_)
+                    }
+                    if (transport_) {
+                        reasons[n] = Wake::Transport;
                         handles[n++] = transport_->wakeEvent();
+                    }
                     const DWORD timeout = active ? 50 : 20;
                     const DWORD r = n ? WaitForMultipleObjects(n, handles, FALSE, timeout) : WAIT_TIMEOUT;
                     if (!n)
                         pollTimer.wait(timeout);
+                    if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + n)
+                        wake = reasons[r - WAIT_OBJECT_0];
                     const bool frameSignalled = capture && active && r == WAIT_OBJECT_0;
                     // A carried frame is only replaced once a newer one has actually arrived.
                     if (capture && active && (!carried || frameSignalled))
@@ -434,6 +626,8 @@ void StreamingEngine::loop() {
                 }
                 const auto iterationStart = Clock::now();
                 ++iterations;
+                loop.woke(wake);
+                const uint64_t encodedBefore = encoded;
                 MSG msg;
                 while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                     TranslateMessage(&msg);
@@ -457,9 +651,23 @@ void StreamingEngine::loop() {
                         const auto target = transport_->targetBitrate();
                         if (target <= bitrate * 3 / 4 || target >= bitrate + 2000000) {
                             configuredBitrate = target;
+                            const auto since =
+                                std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - lastEncoderChange)
+                                    .count();
                             lastEncoderChange = Clock::now();
-                            logInfo("Recreating hardware encoder at " + std::to_string(target) +
-                                    " bps (live bitrate update unsupported)");
+                            ++encoderRebuilds;
+                            // The receiver's numbers that drove the controller to this target, so a rebuild storm
+                            // can be traced back to the link rather than guessed at.
+                            auto s = snapshot();
+                            logInfo("Recreating hardware encoder: " + std::to_string(bitrate) + " -> " +
+                                    std::to_string(target) + " bps after " + std::to_string(since) +
+                                    " s (rebuild " + std::to_string(encoderRebuilds) + " this session; live "
+                                    "bitrate update unsupported) | receiver loss " +
+                                    (s.loss ? fixed(*s.loss * 100, 2) + "%" : "-") + ", rtt " +
+                                    (s.rttMs ? fixed(*s.rttMs) + " ms" : "-") + ", jitter " +
+                                    (s.jitterMs ? fixed(*s.jitterMs) + " ms" : "-") + ", estimate " +
+                                    (s.receiverEstimateBps ? std::to_string(*s.receiverEstimateBps) + " bps" : "-"));
+                            encoderRebuildStart = Clock::now();
                             break;
                         }
                     }
@@ -488,15 +696,26 @@ void StreamingEngine::loop() {
                             sourceToEncoded.add((done - f.presented) / 10000.0);
                         sizes.add(double(f.bytes.size()));
                         frameBytesMax = std::max(frameBytesMax, double(f.bytes.size()));
-                        if (f.keyframe)
+                        // Keyframes and delta frames are averaged apart: a keyframe here is an order of magnitude
+                        // larger and several times slower, so one mean over both hides both numbers.
+                        if (f.keyframe) {
                             ++keyframes;
+                            keyframeSizes.add(double(f.bytes.size()));
+                            keyframeEncodeTimes.add(f.latencyMs);
+                        } else
+                            deltaSizes.add(double(f.bytes.size()));
+                        if (!firstEncodedMs)
+                            firstEncodedMs = std::chrono::duration<double, std::milli>(Clock::now() - ready).count();
                         if (transport_) {
                             const auto sendStart = Clock::now();
-                            transport_->send(f);
+                            const bool sent = transport_->send(f);
                             const auto sendMs =
                                 std::chrono::duration<double, std::milli>(Clock::now() - sendStart).count();
                             sendTimes.add(sendMs);
                             sendMaxMs = std::max(sendMaxMs, sendMs);
+                            if (sent && !firstSentMs)
+                                firstSentMs =
+                                    std::chrono::duration<double, std::milli>(Clock::now() - ready).count();
                         }
                     }
                     if (encoder->pending() && Clock::now() - lastInput > std::chrono::seconds(3))
@@ -506,11 +725,14 @@ void StreamingEngine::loop() {
                 if (frame) {
                     fresh = true;
                     ++captured;
-                    if (frame->accumulated > 1)
+                    if (frame->accumulated > 1) {
                         dropped += frame->accumulated - 1;
+                        droppedCoalesced += frame->accumulated - 1;
+                    }
                     if (carried) {
                         // Superseded by a newer frame before the encoder could take it.
                         ++dropped;
+                        ++droppedSuperseded;
                         carried.reset();
                     }
                     if (frame->presented) {
@@ -571,6 +793,7 @@ void StreamingEngine::loop() {
                         }
                         if (encoder && o.mode != PipelineMode::Encode && encoder->holds(nv12)) {
                             ++dropped; // Encoder is more than a ring behind: drop rather than overwrite.
+                            ++droppedRingBusy;
                             if (capture)
                                 capture->release();
                         } else {
@@ -585,9 +808,10 @@ void StreamingEngine::loop() {
                             haveSurface = true;
                             if (encoder) {
                                 const int64_t sampleTime = std::max(stamp - epoch, lastSampleTime + 1);
-                                if (!encoder->submit(nv12, sampleTime, frame->presented))
+                                if (!encoder->submit(nv12, sampleTime, frame->presented)) {
                                     ++dropped;
-                                else {
+                                    ++droppedSubmitFailed;
+                                } else {
                                     lastSampleTime = sampleTime;
                                     lastSlot = o.mode == PipelineMode::Encode ? 0 : slot;
                                     if (lastSubmit)
@@ -648,8 +872,20 @@ void StreamingEngine::loop() {
                         s.sourceToEncodedMsMean = sourceToEncoded.mean();
                         s.sourceToEncodedMsP95 = sourceToEncoded.percentile(.95);
                     }
+                    const auto wakes = loop - previousLoop;
                     s.loopWakeupsPerSecond = (iterations - previousIterations) / interval;
                     s.loopMaxMs = loopMaxMs;
+                    s.loopBusyPercent = wakes.busyMs / (interval * 1000) * 100;
+                    s.wokeForFrame = wakes.frame;
+                    s.wokeForEncoder = wakes.encoder;
+                    s.wokeForTransport = wakes.transport;
+                    s.wokeForTimeout = wakes.timeout;
+                    s.wokeIdle = wakes.idle;
+                    s.droppedCoalesced = droppedCoalesced;
+                    s.droppedSuperseded = droppedSuperseded;
+                    s.droppedRingBusy = droppedRingBusy;
+                    s.droppedSubmitFailed = droppedSubmitFailed;
+                    s.paced = paced;
                     s.sendMsMean = sendTimes.mean();
                     s.sendMsMax = sendMaxMs;
                     s.submitIntervalMsP95 = submitIntervals.percentile(.95);
@@ -657,11 +893,30 @@ void StreamingEngine::loop() {
                     s.frameBytesMax = frameBytesMax;
                     s.keyframes = keyframes;
                     s.frameBytesMean = sizes.mean();
+                    s.keyframeBytesMean = keyframeSizes.mean();
+                    s.deltaBytesMean = deltaSizes.mean();
+                    s.keyframeEncodeMsMean = keyframeEncodeTimes.mean();
+                    s.encoderRebuilds = encoderRebuilds;
+                    s.encoderRebuildMsMean = encoderRebuildTimes.mean();
+                    s.buildMs = buildMs;
+                    s.firstEncodedMs = firstEncodedMs;
+                    s.firstSentMs = firstSentMs;
+                    s.topologyCheckMsMax = topologyCheckMaxMs;
                     s.bitrate = bitrate;
                     s.targetBitrate = transport_ ? transport_->targetBitrate() : bitrate;
                     s.dynamicBitrate = dynamicBitrate;
                     s.queueDepth = encoder ? encoder->pending() : 0;
-                    s.cpuPercent = cpu.sample();
+                    const auto usage = resources.sample(selected.adapter.Get());
+                    s.cpuPercent = usage.cpuPercent;
+                    s.cpuKernelPercent = usage.cpuKernelPercent;
+                    s.workingSetMb = (usage.workingSetBytes + 512 * 1024) / (1024 * 1024);
+                    s.privateMb = (usage.privateBytes + 512 * 1024) / (1024 * 1024);
+                    s.gpuMemoryMb = (usage.gpuLocalUsedBytes.value_or(0) + usage.gpuSharedUsedBytes.value_or(0) +
+                                     512 * 1024) /
+                                    (1024 * 1024);
+                    s.handles = usage.handles;
+                    s.onBattery = usage.onBattery;
+                    s.batterySaver = usage.batterySaver;
                     s.width = ow;
                     s.height = oh;
                     s.fps = o.fps;
@@ -672,6 +927,8 @@ void StreamingEngine::loop() {
                     if (transport_)
                         transport_->fillMetrics(s);
                     publish(s);
+                    if (stream)
+                        quality.update(s, encoderRebuilds);
                     nlohmann::json stats = {{"type", "host-stats"},
                                             {"seconds", elapsed},
                                             {"captured", captured},
@@ -714,7 +971,39 @@ void StreamingEngine::loop() {
                                             {"submit_interval_ms_max", s.submitIntervalMsMax},
                                             {"frame_bytes_max", s.frameBytesMax},
                                             {"keyframes", keyframes},
-                                            {"pattern_presented", pattern ? pattern->presented() : 0}};
+                                            {"pattern_presented", pattern ? pattern->presented() : 0},
+                                            // Added for optimization work: where the CPU goes, why frames are
+                                            // lost, what a keyframe really costs, and how long a rebuild hurts.
+                                            {"loop_busy_percent", s.loopBusyPercent},
+                                            {"woke_for_frame", wakes.frame},
+                                            {"woke_for_encoder", wakes.encoder},
+                                            {"woke_for_transport", wakes.transport},
+                                            {"woke_for_timeout", wakes.timeout},
+                                            {"woke_idle", wakes.idle},
+                                            {"dropped_coalesced", droppedCoalesced},
+                                            {"dropped_superseded", droppedSuperseded},
+                                            {"dropped_ring_busy", droppedRingBusy},
+                                            {"dropped_submit_failed", droppedSubmitFailed},
+                                            {"keyframe_bytes_mean", keyframeSizes.mean()},
+                                            {"delta_bytes_mean", deltaSizes.mean()},
+                                            {"keyframe_encode_ms_mean", keyframeEncodeTimes.mean()},
+                                            {"encoder_rebuilds", encoderRebuilds},
+                                            {"encoder_rebuild_ms_mean", encoderRebuildTimes.mean()},
+                                            {"build_ms", buildMs},
+                                            {"first_encoded_ms", optionalNumber(firstEncodedMs)},
+                                            {"first_sent_ms", optionalNumber(firstSentMs)},
+                                            {"topology_check_ms_mean", topologyCheckTimes.mean()},
+                                            {"topology_check_ms_max", topologyCheckMaxMs},
+                                            {"viewer_connected", transport_ ? transport_->connected() : false},
+                                            {"fps_setting", o.fps},
+                                            // Hoisted out of the receiver block: these are what "pixelated" and
+                                            // "glitchy" actually are, and they are the first thing to plot.
+                                            {"receiver_qp", optionalNumber(s.viewerQp)},
+                                            {"receiver_corrupted", optionalNumber(s.viewerCorrupted)},
+                                            {"receiver_freezes", optionalNumber(s.viewerFreezes)},
+                                            {"receiver_pli", optionalNumber(s.viewerPli)},
+                                            {"encoded_bits_per_second", s.encodeFps * s.frameBytesMean * 8}};
+                    describe(stats, usage);
                     if (converter && converter->gpuTimes().count()) {
                         // This asynchronous GPU command span includes driver submission delay.
                         // It is not a pure video-processor execution duration.
@@ -726,8 +1015,55 @@ void StreamingEngine::loop() {
                     }
                     if (o.statsSink)
                         o.statsSink(stats);
+                    // The full sample goes to perf.jsonl every second; host.log gets a readable digest far less
+                    // often, so it stays a story of what happened rather than a wall of numbers.
+                    logRecord(stats.dump());
+                    if (now - lastSummary >= kSummaryInterval) {
+                        lastSummary = now;
+                        std::string line =
+                            "Stream: capture " + fixed(s.captureFps) + " fps, encode " + fixed(s.encodeFps) +
+                            " fps | encode " + fixed(s.encodeMsMean.value_or(0)) + " ms (p95 " +
+                            fixed(s.encodeMsP95.value_or(0)) + ") | present to encoded " +
+                            fixed(s.sourceToEncodedMsMean.value_or(0)) + " ms | queue " +
+                            std::to_string(s.queueDepth) + " | " + std::to_string(bitrate / 1000) + " kbps (target " +
+                            std::to_string(s.targetBitrate / 1000) + ") | frame " +
+                            std::to_string(uint64_t(s.frameBytesMean)) + " B, keyframe " +
+                            std::to_string(uint64_t(s.keyframeBytesMean)) + " B";
+                        logInfo(line);
+                        logInfo("Engine thread: " + fixed(s.loopWakeupsPerSecond, 0) + " wake-ups/s (" +
+                                std::to_string(wakes.frame) + " frame, " + std::to_string(wakes.encoder) +
+                                " encoder, " + std::to_string(wakes.transport) + " transport, " +
+                                std::to_string(wakes.timeout) + " timeout; " + std::to_string(wakes.idle) +
+                                " did nothing), busy " + fixed(s.loopBusyPercent) + "% of wall time, longest " +
+                                fixed(loopMaxMs) + " ms | " + summarize(usage));
+                        if (dropped || paced)
+                            logInfo("Frames not encoded: " + std::to_string(dropped) + " dropped (" +
+                                    std::to_string(droppedCoalesced) + " coalesced, " +
+                                    std::to_string(droppedSuperseded) + " superseded, " +
+                                    std::to_string(droppedRingBusy) + " ring busy, " +
+                                    std::to_string(droppedSubmitFailed) + " refused), " + std::to_string(paced) +
+                                    " paced out, " + std::to_string(noChange) + " polls with no new frame");
+                        if (transport_) {
+                            auto receiver = [](const std::optional<double> &v, const char *unit, int decimals = 1) {
+                                return v ? fixed(*v, decimals) + unit : std::string("-");
+                            };
+                            logInfo("Receiver: " + receiver(s.viewerFps, " fps") + " | " +
+                                    receiver(s.rttMs, " ms rtt") + " | " +
+                                    (s.loss ? fixed(*s.loss * 100, 2) + "% loss" : "- loss") + " | " +
+                                    receiver(s.jitterMs, " ms jitter") + " | quantizer " +
+                                    receiver(s.viewerQp, "", 0) + " | corrupted " +
+                                    receiver(s.viewerCorrupted, "", 0) + " | freezes " +
+                                    receiver(s.viewerFreezes, "", 0) + " | jitter buffer " +
+                                    receiver(s.viewerJitterBufferMs, " ms") + " | decode " +
+                                    receiver(s.viewerDecodeMs, " ms") + " | keyframe requests " +
+                                    std::to_string(s.keyframeRequests) + " | transport buffer " +
+                                    std::to_string(s.bufferBytes / 1024) + " KB | send dropped " +
+                                    std::to_string(s.transportDropped));
+                        }
+                    }
                     previousCaptured = captured;
                     previousEncoded = encoded;
+                    previousLoop = loop;
                     previousIterations = iterations;
                     if (csv) {
                         auto opt = [](const std::optional<double> &v) { return v ? *v : 0.0; };
@@ -754,7 +1090,14 @@ void StreamingEngine::loop() {
                         throw std::runtime_error("Display topology changed; revalidate selection");
                     if (now - lastFullCheck >= std::chrono::seconds(10)) {
                         lastFullCheck = now;
+                        // DXGI enumeration is a known multi-millisecond stall on this thread; measured so its
+                        // real cost is on record rather than assumed.
+                        const auto enumerateStart = Clock::now();
                         auto current = displays();
+                        const double enumerateMs =
+                            std::chrono::duration<double, std::milli>(Clock::now() - enumerateStart).count();
+                        topologyCheckTimes.add(enumerateMs);
+                        topologyCheckMaxMs = std::max(topologyCheckMaxMs, enumerateMs);
                         auto found = std::find_if(current.begin(), current.end(),
                                                   [&](auto &d) { return d.name == selected.name; });
                         if (found == current.end() || found->monitor != selected.monitor ||
@@ -764,8 +1107,14 @@ void StreamingEngine::loop() {
                             throw std::runtime_error("Display topology changed; revalidate selection");
                     }
                 }
-                loopMaxMs = std::max(
-                    loopMaxMs, std::chrono::duration<double, std::milli>(Clock::now() - iterationStart).count());
+                const double iterationMs =
+                    std::chrono::duration<double, std::milli>(Clock::now() - iterationStart).count();
+                loopMaxMs = std::max(loopMaxMs, iterationMs);
+                loop.busyMs += iterationMs;
+                // A wake-up that produced neither a frame to work on nor an encoded frame did nothing useful.
+                // While the desktop is still, these are the entire CPU cost of running at all.
+                if (!frame && encoded == encodedBefore)
+                    ++loop.idle;
             }
         } catch (const std::exception &e) {
             logWarning(e.what());

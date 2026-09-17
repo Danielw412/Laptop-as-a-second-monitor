@@ -19,6 +19,13 @@ class BitrateController {
     uint32_t bitrate() const {
         return bitrate_;
     }
+    /// The smoothed values the last decision was actually made on, which are what explain it in a log.
+    double smoothedLoss() const {
+        return loss_;
+    }
+    double smoothedRtt() const {
+        return rtt_;
+    }
     uint32_t update(double loss, double rtt, double jitter) {
         if (!std::isfinite(loss) || !std::isfinite(rtt) || !std::isfinite(jitter) || loss < 0 || loss > 1 ||
             rtt < 0 || rtt > 60000 || jitter < 0)

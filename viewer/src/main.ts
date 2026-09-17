@@ -1,6 +1,7 @@
 import "./style.css";
 import { Session, type Credentials } from "./session";
 import { Dashboard } from "./dashboard";
+import { rememberServer, savedServer, usableSignalingUrl } from "./preferences";
 import {
   CODE_ALPHABET,
   CODE_LENGTH,
@@ -16,7 +17,9 @@ const server = el<HTMLInputElement>("server"),
   code = el<HTMLInputElement>("code"),
   video = el<HTMLVideoElement>("video");
 const defaultServer = import.meta.env.VITE_SIGNALING_URL ?? "https://browser-monitor-signaling.danielruoqiao.workers.dev";
-server.value = defaultServer;
+// A server entered once is kept for good (cookie, with localStorage as a fallback), so the only thing anyone has
+// to type on a return visit is the pairing code.
+server.value = savedServer() ?? defaultServer;
 const dashboard = new Dashboard(el("dashboard-grid"));
 const storageKey = "laptop-monitor-session";
 type Saved = { server: string; room: string; token: string };
@@ -28,7 +31,11 @@ try {
 } catch { /* Session storage can be disabled by browser policy. */ }
 const params = new URLSearchParams(location.hash.slice(1));
 if (params.has("code")) code.value = normalizeCode(params.get("code")!);
-if (params.has("server")) server.value = params.get("server")!;
+if (params.has("server")) {
+  // A link that carries a server wins over the remembered one, and replaces it from then on.
+  server.value = params.get("server")!;
+  rememberServer(server.value);
+}
 if (location.hash)
   history.replaceState(null, "", location.pathname + location.search);
 let session: Session | undefined;
@@ -77,6 +84,7 @@ function start(credentials: Credentials, stream?: MediaStream) {
       if (credentials.role !== "viewer" || !p.room || !p.token) return;
       saved = { server: server.value, room: p.room, token: p.token };
       try { sessionStorage.setItem(storageKey, JSON.stringify(saved)); } catch {}
+      rememberServer(server.value); // A server that actually paired is worth keeping.
     },
     (reason) => {
       // The host ended this session or rejected the credentials: never retry silently with the same ones.
@@ -94,12 +102,17 @@ el("join").addEventListener("submit", (e) => {
     const value = normalizeCode(code.value);
     code.value = value;
     if (!CODE_RE.test(value)) throw Error(`Enter the ${CODE_LENGTH}-character code shown in Laptop Monitor.`);
+    rememberServer(server.value);
     forget();
     start({ role: "viewer", code: value });
   } catch (e) {
     el("error").textContent = e instanceof Error ? e.message : String(e);
   }
 });
+// Remembered as soon as it is edited, not only on a successful connect: a server typed into a page that is then
+// closed without connecting is exactly the one nobody wants to type again.
+server.addEventListener("change", () => rememberServer(server.value));
+server.addEventListener("blur", () => rememberServer(server.value));
 code.addEventListener("input", () => {
   const value = normalizeCode(code.value).slice(0, CODE_LENGTH);
   if (value !== code.value) code.value = value;
@@ -157,7 +170,7 @@ el("test-pattern").onclick = () =>
   })();
 window.addEventListener("pagehide", () => stop(false));
 if (saved) {
-  server.value = saved.server;
+  server.value = usableSignalingUrl(saved.server) ?? server.value;
   try { start({ role: "viewer", room: saved.room, token: saved.token }); } catch { el("error").textContent = "The previous session could not resume. Enter the current code."; }
 } else if (CODE_RE.test(code.value)) {
   try { start({ role: "viewer", code: code.value }); } catch (e) { el("error").textContent = String(e); }

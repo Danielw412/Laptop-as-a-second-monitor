@@ -59,6 +59,10 @@ Edge or Safari on the other laptop.
 3. On the other laptop, open the receiver page and enter the code. The stream starts; the app shows **Connected**
    with live FPS, bitrate, RTT, dropped frames, resolution and encoder.
 
+Only the code has to be typed. If the receiver runs against its own signaling worker, set it once under *Advanced*:
+the address is kept in a cookie (with localStorage as a fallback) scoped to that page, so it comes back on every
+later visit. A `#server=` link overrides it and replaces what was stored.
+
 LaptopMon is found by its EDID identity (manufacturer `LMV`, product `0001`, name `LaptopMon`), never by its
 `\\.\DISPLAYn` number, which Windows reassigns. Laptop Monitor never falls back to a physical display: if
 LaptopMon is missing it waits, and if it is set as the primary display it refuses and tells you.
@@ -108,8 +112,8 @@ reconnecting, red error, grey stopped. A balloon appears when the receiver conne
   capture, encode and frame-to-encoded latency (measured from the compositor's own frame stamp), how long frames
   waited before capture, the receiver's jitter-buffer and decode delay, encoder queue and keyframes, connection
   duration, sent frames/bytes, signaling and WebRTC state, GPU, encoder, capture backend, video path (GPU, no CPU
-  readback), host CPU, setup status. *Copy diagnostics* puts all of it plus the recent log on the clipboard; *Open log folder* opens
-  `%LOCALAPPDATA%\LaptopMonitor\logs`.
+  readback), host CPU, setup status. *Copy diagnostics* puts all of it plus the drop breakdown, engine-thread cost,
+  process RAM/GPU memory and the recent log on the clipboard; *Open log folder* opens `%TEMP%\LaptopMonitor`.
 - **Settings**: start at sign-in, start the virtual display automatically, keep running in the tray on close,
   diagnostics log, Windows scaling for LaptopMon only (see *Scaling*), capture backend (Auto prefers Windows Graphics Capture and falls back to DXGI duplication),
   frame rate (60/30), quality preset (Efficient 5→10 Mbps, Balanced 8→16 Mbps, Quality 12→20 Mbps), signaling URL
@@ -153,7 +157,7 @@ removes, in this order:
 1. the running helper and the scheduled task *Laptop Monitor Display*;
 2. `%ProgramFiles%\Laptop Monitor\`;
 3. the *start at sign-in* entry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\LaptopMonitor`);
-4. `%LOCALAPPDATA%\LaptopMonitor\` (settings, host credential, logs);
+4. `%LOCALAPPDATA%\LaptopMonitor\` (settings, host credential) and `%TEMP%\LaptopMonitor\` (logs);
 5. the driver package, the `SWD\LaptopMonitorIdd` device node and the local signing certificate, via
    `scripts/install-driver.ps1 -Uninstall` (when the scripts folder is found next to the build; otherwise the
    driver package is removed with `pnputil` and the certificate is left for `install-driver.ps1 -Uninstall`).
@@ -199,7 +203,8 @@ tests/                    vitest (protocol, telemetry) and the signaling integra
   `npm run test:integration` in another (exercises credential auth, code pairing, tickets, one-viewer limit,
   rotation overlap, resume, kick, host replacement, throttling against the local worker).
 - Receiver against a local worker: `npm run dev:viewer`, open `http://127.0.0.1:5173`, expand *Advanced* and set the
-  signaling URL to `http://127.0.0.1:8787`; point the app's Settings → Signaling URL at the same address.
+  signaling URL to `http://127.0.0.1:8787` (it is remembered from then on); point the app's Settings → Signaling URL
+  at the same address.
 - Bench: `laptop-monitor-bench --list`, then e.g.
   `laptop-monitor-bench --laptopmon --capture wgc --mode capture-encode --pattern --seconds 20 --csv out.csv`.
   `--mode stream` pairs like the app (prints the code on the console). `benchmarks/run.ps1` runs the matrix.
@@ -223,8 +228,44 @@ playout-delay header extension set to zero so the browser renders each frame as 
 encoder accepts but ignores live bitrate changes, so bitrate adaptation still recreates the encoder; the periodic
 keyframe interval is 10 s (keyframes are otherwise produced on demand: viewer join, PLI, transport drop).
 
-Logs go to `%LOCALAPPDATA%\LaptopMonitor\logs\host.log` (2 MB rotation) and `setup.log`; they never contain codes
-or credentials.
+### Logging
+
+Everything is written to `%TEMP%\LaptopMonitor\` (*Open log folder* in Details goes straight there), on two
+channels, both governed by the *diagnostics log* setting and neither ever containing a pairing code or credential:
+
+- `host.log` (2 MB, rotates to `host.1.log`) - readable lines: startup with the machine profile and the settings in
+  force, lifecycle and state changes, how long the virtual display and the pipeline took to build and where that
+  time went, encoder rebuilds with the receiver numbers that caused them, bitrate cuts, keyframe storms, a send
+  queue that will not drain, a performance digest every 30 s, what the window itself costs every 2 min, and a
+  one-line summary of each pipeline session as it ends. `setup.log` holds the elevated setup and uninstall runs.
+- `perf.jsonl` (8 MB, rotates to `perf.1.jsonl`) - one JSON object per second while streaming, with the full
+  sample: capture/encode rates and latencies with percentiles, the four drop causes counted apart (coalesced,
+  superseded, ring busy, refused) plus paced frames, engine-thread wake-ups by reason and the share of wall time
+  the thread was awake, keyframe versus delta frame size and encode cost, process CPU split into kernel and user
+  time, working set, GPU memory in use, handles, battery and battery-saver state, encoder rebuild count and cost,
+  the display re-enumeration stall, transport buffer pressure, the selected ICE route, and the receiver's own
+  telemetry. This is the file to read when the question is "where is the CPU, GPU or memory going".
+
+The per-second record is the same object the benchmark writes to its CSV and JSON sink, so a field measured in
+`benchmarks/` means the same thing in a user's log.
+
+#### Picture quality episodes
+
+"It went extremely pixelated and glitchy, then fixed itself" is two different faults that look alike, and both are
+over before anyone can look. The receiver reports the decoder's mean quantizer (pixelation itself: roughly 20-30
+normal, over 36 visibly blocky), frames that arrived but never decoded, freezes, PLI and NACK; the host watches
+those together with its own encoded bit rate and writes one line when quality drops and one when it recovers:
+
+```
+[warn ] Picture quality dropped: encoded rate fell to 1.4 Mbps from a usual 7.1 Mbps | encoder 1500 kbps …
+[info ] Picture quality recovered after 14 s (started: …) | worst quantizer 44, lowest encoded rate 1.31 Mbps |
+        encoder was recreated 2 time(s) at a lower bitrate: too few bits for this resolution
+```
+
+The closing line names the cause: an encoder recreated at a lower bitrate (too few bits for 1080p, so the
+quantizer climbs and the picture turns to blocks), packet loss (torn and smeared blocks until a keyframe repairs
+them), or a quantizer that rose on its own because the desktop content got harder to encode. Watching only; it
+never changes what the pipeline does.
 
 ## Troubleshooting
 

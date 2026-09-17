@@ -423,7 +423,8 @@ int performUninstall() {
         ++problems;
     }
     setStartAtSignIn(false);
-    Log::instance().closeFile();
+    // Settings and the credential go now; the logs live in Temp and are removed last, so this run can still
+    // report what it did.
     std::filesystem::remove_all(appDataDirectory(), ec);
     // Driver package, device node and the local signing certificate: the install script knows exactly what it
     // created, so it removes them.
@@ -476,6 +477,9 @@ int performUninstall() {
         }
     }
     logInfo("Uninstall: complete");
+    Log::instance().closeFile();
+    Log::instance().closeRecordFile();
+    std::filesystem::remove_all(logDirectory(), ec);
     if (problems)
         MessageBoxW(nullptr, L"Laptop Monitor was removed, but some items could not be cleaned up. See the log.",
                     L"Laptop Monitor", MB_ICONWARNING | MB_OK);

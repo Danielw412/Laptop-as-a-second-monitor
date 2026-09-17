@@ -121,6 +121,15 @@ class Transport final : public ITransport {
     uint64_t keyframeRequests_ = 0, keyframesSent_ = 0;
     std::optional<Clock::time_point> keyframeRequested_;
     BitrateController adaptation_;
+    // Adaptation and back-pressure bookkeeping. Every one of these is a reason the picture got worse, and each
+    // is reported rarely enough (or only in the per-second record) to stay readable.
+    uint32_t bitrateDown_ = 0, bitrateUp_ = 0;
+    Clock::time_point lastBitrateLog_ = Clock::now() - std::chrono::hours(1);
+    uint64_t bufferPressure_ = 0, lastBufferPressure_ = 0;
+    size_t bufferBytesMax_ = 0;
+    Clock::time_point lastPressureLog_ = Clock::now() - std::chrono::hours(1);
+    Clock::time_point keyframeWindow_ = Clock::now();
+    uint64_t keyframeWindowRequests_ = 0;
     Json receiver_ = Json::object();
     mutable std::mutex pairingMutex_;
     PairingSnapshot pairingSnapshot_;
@@ -162,6 +171,17 @@ class Transport final : public ITransport {
         else
             connectedSince_.reset();
         emit(up ? TransportEventType::WebRtcConnected : TransportEventType::WebRtcDisconnected);
+    }
+    /// The candidate pair ICE settled on, as "host -> host over UDP". A relayed pair or a TCP one explains a
+    /// higher latency that has nothing to do with the encoder.
+    std::string describeRoute() const {
+        static const char *const kinds[] = {"unknown", "host", "server-reflexive", "peer-reflexive", "relayed"};
+        static const char *const transports[] = {"unknown", "UDP", "TCP-active", "TCP-passive", "TCP-so", "TCP"};
+        rtc::Candidate local, remote;
+        if (!peer_ || !peer_->getSelectedCandidatePair(&local, &remote))
+            return "not selected yet";
+        return std::string(kinds[size_t(local.type())]) + " -> " + kinds[size_t(remote.type())] + " over " +
+               transports[size_t(local.transportType())];
     }
     void updatePairingSnapshot() {
         std::lock_guard lock(pairingMutex_);
@@ -419,6 +439,12 @@ class Transport final : public ITransport {
                         reported_ = false;
                         timings_["connected_ms"] =
                             std::chrono::duration<double, std::milli>(Clock::now() - peerStart_).count();
+                        // How long each half of the handshake took, and over which route. This is the whole of
+                        // "why did it take that long before my screen appeared", on the host's side of it.
+                        logInfo("Negotiation: answer " +
+                                std::to_string(int(timings_.value("answer_ms", 0.0))) + " ms, connected " +
+                                std::to_string(int(timings_.value("connected_ms", 0.0))) + " ms | route " +
+                                describeRoute());
                         setWebRtc(true);
                     } else if (s == rtc::PeerConnection::State::Disconnected) {
                         deadline_ = Clock::now() + std::chrono::seconds(20);
@@ -440,7 +466,25 @@ class Transport final : public ITransport {
                         continue;
                     double loss = b.at("loss").get<double>(), rtt = b.at("rttMs").get<double>(),
                            jitter = b.at("jitterMs").get<double>();
-                    adaptation_.update(loss, rtt, jitter);
+                    const auto before = adaptation_.bitrate();
+                    const auto after = adaptation_.update(loss, rtt, jitter);
+                    if (after < before) {
+                        ++bitrateDown_;
+                        // A cut is the interesting direction: it is what the viewer sees as a softer picture, and
+                        // on this encoder it forces a full rebuild. Reported at most once every five seconds.
+                        if (Clock::now() - lastBitrateLog_ > std::chrono::seconds(5)) {
+                            lastBitrateLog_ = Clock::now();
+                            logInfo("Bitrate target cut " + std::to_string(before / 1000) + " -> " +
+                                    std::to_string(after / 1000) + " kbps (loss " +
+                                    std::to_string(int(loss * 10000) / 100.0) + "%, smoothed " +
+                                    std::to_string(int(adaptation_.smoothedLoss() * 10000) / 100.0) + "%, rtt " +
+                                    std::to_string(int(rtt)) + " ms, smoothed " +
+                                    std::to_string(int(adaptation_.smoothedRtt())) + " ms, jitter " +
+                                    std::to_string(int(jitter)) + " ms; " + std::to_string(bitrateDown_) +
+                                    " cuts, " + std::to_string(bitrateUp_) + " raises this session)");
+                        }
+                    } else if (after > before)
+                        ++bitrateUp_;
                     lastTelemetry_ = Clock::now();
                 }
             } catch (const std::exception &) {
@@ -451,6 +495,31 @@ class Transport final : public ITransport {
             logWarning(directFailure);
             reported_ = true;
         }
+        reportPressure();
+    }
+    /// Two things that quietly ruin the picture and never raise an error: the receiver asking for keyframes over
+    /// and over (each one is a 240-300 KB, 20-30 ms frame), and the send queue never draining.
+    void reportPressure() {
+        const auto now = Clock::now();
+        if (now - keyframeWindow_ < std::chrono::seconds(10))
+            return;
+        const auto seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(now - keyframeWindow_).count();
+        const auto requests = keyframeRequests_ - keyframeWindowRequests_;
+        keyframeWindow_ = now;
+        keyframeWindowRequests_ = keyframeRequests_;
+        if (requests > 2 && connected())
+            logWarning("Receiver asked for " + std::to_string(requests) + " keyframes in " +
+                       std::to_string(seconds) + " s; each one costs a full intra frame. Usually packet loss.");
+        const auto pressure = bufferPressure_ - lastBufferPressure_;
+        lastBufferPressure_ = bufferPressure_;
+        if (pressure && now - lastPressureLog_ > std::chrono::seconds(30)) {
+            lastPressureLog_ = now;
+            logWarning("Send queue was still draining for " + std::to_string(pressure) + " frames in " +
+                       std::to_string(seconds) + " s (peak " + std::to_string(bufferBytesMax_ / 1024) +
+                       " KB). The link cannot carry the current bitrate.");
+        }
+        bufferBytesMax_ = 0;
     }
     bool connected() const override {
         return peer_ && peer_->state() == rtc::PeerConnection::State::Connected && track_ && track_->isOpen();
@@ -461,7 +530,13 @@ class Transport final : public ITransport {
             logWarning("TEST MODE: discarded first keyframe to exercise browser PLI");
             return false;
         }
-        if (!connected() || track_->bufferedAmount() > 128 * 1024) {
+        const size_t buffered = track_ ? track_->bufferedAmount() : 0;
+        bufferBytesMax_ = std::max(bufferBytesMax_, buffered);
+        // Anything still queued when the next frame arrives is latency the receiver will feel; the 128 KB line is
+        // where frames start being thrown away instead.
+        if (buffered > 32 * 1024)
+            ++bufferPressure_;
+        if (!connected() || buffered > 128 * 1024) {
             ++dropped_;
             mailbox_->idr = true;
             return false;
@@ -525,7 +600,14 @@ class Transport final : public ITransport {
                 {"encoded_bytes_sent", bytes_},
                 {"transport_dropped", dropped_},
                 {"transport_buffer_bytes", track_ ? track_->bufferedAmount() : 0},
+                {"transport_buffer_pressure", bufferPressure_},
                 {"receiver_estimate_bps", mailbox_->remb.load()},
+                {"bitrate_cuts", bitrateDown_},
+                {"bitrate_raises", bitrateUp_},
+                {"smoothed_loss", adaptation_.smoothedLoss()},
+                {"smoothed_rtt_ms", adaptation_.smoothedRtt()},
+                {"route", describeRoute()},
+                {"signaling_url", url_},
                 {"receiver", receiver_}};
     }
     SignalingState signaling() const override {
@@ -606,6 +688,11 @@ class Transport final : public ITransport {
         m.viewerJitterBufferMs = number("jitterBufferMs");
         m.viewerDecodeMs = number("decodeMs");
         m.viewerProcessingMs = number("processingMs");
+        m.viewerQp = number("qp");
+        m.viewerCorrupted = number("corrupted");
+        m.viewerFreezes = number("freezes");
+        m.viewerPli = number("pli");
+        m.viewerNack = number("nack");
         if (auto v = number("dropped"))
             m.viewerDropped = uint64_t(std::max(0.0, *v));
         if (auto v = number("decoded"))

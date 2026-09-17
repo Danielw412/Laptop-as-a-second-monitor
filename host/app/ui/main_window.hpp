@@ -2,6 +2,7 @@
 // The single application window: three compact pages (Overview, Details, Settings) drawn with Direct2D, plus the
 // tray icon. Controls are laid out and drawn immediately each paint; hit testing uses the last layout.
 #include "controller.hpp"
+#include "resources.hpp"
 #include "ui/renderer.hpp"
 #include "ui/tray.hpp"
 #include <memory>
@@ -73,6 +74,14 @@ class MainWindow {
     int lastIcon_ = -1;
     std::wstring lastTip_;
     MetricsSnapshot metrics_;
+    // What the window itself costs. A tray application that repaints when nobody is looking is pure waste, so
+    // paints are counted and timed and reported to the log now and then.
+    Samples<256> paintTimes_;
+    uint64_t paints_ = 0, paintsHidden_ = 0;
+    double paintMaxMs_ = 0;
+    Clock::time_point paintReport_ = Clock::now();
+    ResourceMeter uiResources_;
+    void reportUiCost();
     static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
     LRESULT handle(UINT, WPARAM, LPARAM);
     void createControls();

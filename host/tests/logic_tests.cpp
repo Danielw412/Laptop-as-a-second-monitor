@@ -1,6 +1,7 @@
 // Portable tests for pairing, LaptopMon detection, lifecycle state transitions, settings and hashing.
 #include "app_state.hpp"
 #include "display_identity.hpp"
+#include "logging.hpp"
 #include "pairing.hpp"
 #include "settings.hpp"
 #include "sha256.hpp"
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <set>
 #include <stdexcept>
+#include <vector>
 using namespace lm;
 using namespace std::chrono_literals;
 namespace {
@@ -698,6 +700,55 @@ void testSettings() {
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
+
+// The two log channels: readable lines, machine-readable records, and the rotation that keeps both bounded.
+void testLogging() {
+    auto dir = std::filesystem::temp_directory_path() / ("lm-log-test-" + std::to_string(std::rand()));
+    auto &log = Log::instance();
+    log.openFile(dir, "test.log");
+    log.openRecordFile(dir, "test.jsonl");
+    CHECK(log.recording());
+    CHECK(log.path() == dir / "test.log");
+    log.write(LogLevel::Info, "hello");
+    log.writeRecord(R"({"captured":7})");
+    log.writeRecord("{}");   // An empty record must still be a valid line, not a trailing comma.
+    log.writeRecord("junk"); // Anything that is not an object is stamped and left alone.
+    log.closeFile();
+    log.closeRecordFile();
+    CHECK(!log.recording());
+    auto read = [](const std::filesystem::path &path) {
+        std::ifstream file(path);
+        std::vector<std::string> lines;
+        for (std::string line; std::getline(file, line);)
+            lines.push_back(line);
+        return lines;
+    };
+    auto text = read(dir / "test.log");
+    CHECK(text.size() == 1);
+    CHECK(text[0].find("[info ] hello") != std::string::npos);
+    auto records = read(dir / "test.jsonl");
+    CHECK(records.size() == 3);
+    for (auto &line : records) {
+        auto parsed = nlohmann::json::parse(line, nullptr, false);
+        CHECK(!parsed.is_discarded());
+        CHECK(parsed.contains("at"));
+    }
+    CHECK(nlohmann::json::parse(records[0])["captured"] == 7);
+    CHECK(nlohmann::json::parse(records[1]).size() == 1); // Only the stamp
+    // Rotation: past the limit the file is renamed and a fresh one started.
+    log.openRecordFile(dir, "rotate.jsonl");
+    const std::string filler(4096, 'x');
+    for (int i = 0; i < 2200; ++i)
+        log.writeRecord("{\"pad\":\"" + filler + "\"}");
+    log.closeRecordFile();
+    CHECK(std::filesystem::exists(dir / "rotate.1.jsonl"));
+    CHECK(std::filesystem::file_size(dir / "rotate.jsonl") < 8 * 1024 * 1024);
+    // A closed channel silently drops writes rather than failing the caller.
+    log.write(LogLevel::Error, "after close");
+    log.writeRecord(R"({"after":"close"})");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
 } // namespace
 int main() {
     testSha256();
@@ -714,6 +765,7 @@ int main() {
     testExit();
     testFailuresAndRecovery();
     testSettings();
+    testLogging();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";
         return 1;

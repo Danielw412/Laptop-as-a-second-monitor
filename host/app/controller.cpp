@@ -315,10 +315,16 @@ void AppController::updateSettings(const Settings &updated) {
     if (clean.startAtSignIn != settings_.startAtSignIn)
         setStartAtSignIn(clean.startAtSignIn);
     if (clean.diagnosticsLog != settings_.diagnosticsLog) {
-        if (clean.diagnosticsLog)
+        if (clean.diagnosticsLog) {
             Log::instance().openFile(logDirectory());
-        else
+            Log::instance().openRecordFile(logDirectory());
+            logInfo("Diagnostics logging turned on: " + Log::instance().path().string() + " and " +
+                    Log::instance().recordPath().string());
+        } else {
+            logInfo("Diagnostics logging turned off");
             Log::instance().closeFile();
+            Log::instance().closeRecordFile();
+        }
     }
     settings_ = clean;
     model_.autoStartDisplay = clean.autoStartDisplay;

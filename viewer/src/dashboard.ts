@@ -46,6 +46,8 @@ export class Dashboard {
         ["Jitter", number(v.jitterMs, " ms")], ["Frames dropped", number(v.framesDropped, "", 0)],
         ["Jitter buffer / decode", `${number(v.jitterBufferMs)} / ${number(v.decodeMs)} ms`],
         ["Packet to frame", number(v.processingMs, " ms")], ["Freezes", number(v.freezes, "", 0)],
+        // Quantizer is pixelation itself; corrupted frames are the torn, smeared kind of glitch.
+        ["Quantizer (blockiness)", number(v.qp, "", 0)], ["Corrupted frames", number(v.corrupted, "", 0)],
         ["Decoder", text(v.decoder)], ["NACK / PLI", `${number(v.nack,"",0)} / ${number(v.pli,"",0)}`],
       ]],
       ["Host pipeline", [

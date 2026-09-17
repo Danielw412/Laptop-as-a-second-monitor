@@ -129,4 +129,15 @@ export interface Telemetry {
   decodeMs?: number | null;
   processingMs?: number | null;
   freezes?: number | null;
+  /**
+   * What the picture actually looked like, for the host's log. These separate the two ways a stream goes bad:
+   * `qp` is the encoder's quantizer as the decoder saw it, which is pixelation itself (roughly 20-30 normal,
+   * over ~36 visibly blocky); `corrupted`, `pli` and `nack` are loss, which shows up as smearing and torn
+   * blocks until a keyframe arrives. Absent on older receivers.
+   */
+  qp?: number | null;
+  corrupted?: number | null;
+  pli?: number | null;
+  nack?: number | null;
+  keyFramesDecoded?: number | null;
 }

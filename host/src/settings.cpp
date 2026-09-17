@@ -147,7 +147,13 @@ std::filesystem::path credentialPath() {
     return appDataDirectory() / L"host.credential";
 }
 std::filesystem::path logDirectory() {
-    return appDataDirectory() / L"logs";
+    // Diagnostics live in the user's Temp folder: they are disposable by definition, Windows already cleans the
+    // folder, and it is the first place anyone looks for a log. Settings and the credential stay in LOCALAPPDATA.
+    wchar_t value[MAX_PATH + 2]{};
+    const auto size = GetTempPathW(DWORD(std::size(value)), value);
+    if (size && size < std::size(value))
+        return std::filesystem::path(value) / L"LaptopMonitor";
+    return appDataDirectory() / L"logs"; // No usable TEMP: keep logging rather than lose it.
 }
 namespace {
 std::string generateSecret() {
