@@ -16,7 +16,11 @@ const el = <T extends HTMLElement>(id: string) =>
 const server = el<HTMLInputElement>("server"),
   code = el<HTMLInputElement>("code"),
   video = el<HTMLVideoElement>("video");
-const defaultServer = import.meta.env.VITE_SIGNALING_URL ?? "https://browser-monitor-signaling.danielruoqiao.workers.dev";
+// The Pages build passes VITE_SIGNALING_URL through from a repository variable, which is an empty string when
+// that variable is unset - so this falls back on anything falsy, not only on undefined. `??` would have left the
+// field blank, which is the one thing a receiver page must never do.
+const defaultServer =
+  import.meta.env.VITE_SIGNALING_URL || "https://browser-monitor-signaling.danielruoqiao.workers.dev";
 // A server entered once is kept for good (cookie, with localStorage as a fallback), so the only thing anyone has
 // to type on a return visit is the pairing code.
 server.value = savedServer() ?? defaultServer;
