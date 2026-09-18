@@ -3,11 +3,12 @@
  * (host/app/ui/renderer.hpp): #FFDBBB peach, #CCBEB1 taupe, #997E67 mocha, #664930 coffee, over an off-white
  * paper. Every other value below is a tint or shade of those four so the two surfaces read as one product.
  *
- * Shape rule: containers (form, toolbar, panels) use --radius-container, controls (inputs, buttons) use
- * --radius-control. Nothing else is rounded.
+ * Shape rule: floating containers (toolbar, panels) use --radius-container, controls (inputs, buttons) use
+ * --radius-control. Nothing else is rounded; the pairing page's brand panel is full-bleed.
  *
  * Contrast (WCAG AA, checked against --paper): --ink 13.9:1, --ink-muted 4.8:1, --danger 6:1, --accent-text on
- * --accent 9.3:1. Dark values are checked against the dark --paper the same way.
+ * --accent 9.3:1, --panel-ink on --panel 6.3:1 (light) and 8.9:1 (dark). Dark values are checked against the dark
+ * --paper the same way.
  */
 :root {
   color-scheme: light dark;
@@ -24,10 +25,11 @@
   --accent-text: #fff6ec;
   --peach: #ffdbbb;
   --peach-soft: #fff3e7;
-  --peach-line: #f2ddc7;
   --taupe: #ccbeb1;
   --danger: #a8362b;
-  --shadow: 0 16px 48px rgb(102 73 48 / 0.14);
+  --panel: #664930;
+  --panel-ink: #ffdbbb;
+  --panel-glow: rgb(255 219 187 / 0.16);
   /* The stage is a screen: warm near-black so letterbox bars read as bezel, not as page. */
   --stage: #0e0b09;
   --stage-ink: #f3e9df;
@@ -55,10 +57,10 @@
     --accent-text: #3a2617;
     --peach: #ffdbbb;
     --peach-soft: #251c16;
-    --peach-line: #4a3a2f;
     --taupe: #7b6c60;
     --danger: #ff9f92;
-    --shadow: 0 16px 48px rgb(0 0 0 / 0.4);
+    --panel: #4a3424;
+    --panel-glow: rgb(255 219 187 / 0.12);
   }
 }
 * {
@@ -85,14 +87,20 @@ body {
   outline-offset: 3px;
 }
 /* ---- Pairing page ------------------------------------------------------------------------------------------ */
+/* Two halves: a coffee panel that carries the brand and the headline, and the form on the paper beside it. */
 .pairing {
   min-height: 100dvh;
   display: grid;
-  grid-template-rows: auto 1fr auto;
-  gap: 32px;
-  max-width: 1120px;
-  margin: 0 auto;
-  padding: 28px clamp(16px, 4vw, 48px) 24px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+.intro {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 48px;
+  padding: 32px clamp(24px, 4.5vw, 72px) clamp(40px, 9vh, 80px);
+  color: var(--panel-ink);
+  background: radial-gradient(120% 90% at 100% 100%, var(--panel-glow), transparent 60%), var(--panel);
 }
 .brand {
   display: flex;
@@ -105,7 +113,7 @@ body {
 .mark {
   width: 18px;
   height: 13px;
-  border: 2px solid var(--accent);
+  border: 2px solid currentColor;
   border-radius: 4px;
   position: relative;
   top: -2px;
@@ -118,38 +126,25 @@ body {
   bottom: -6px;
   height: 2px;
   border-radius: 1px;
-  background: var(--accent);
-}
-.columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
-  gap: clamp(32px, 6vw, 96px);
-  align-items: center;
+  background: currentColor;
 }
 .intro h1 {
-  margin: 0 0 20px;
-  font-size: clamp(36px, 4.4vw, 50px);
+  margin: 0;
+  font-size: clamp(40px, 5vw, 72px);
   font-weight: 600;
-  line-height: 1.04;
-  letter-spacing: -0.03em;
+  line-height: 1.02;
+  letter-spacing: -0.035em;
   text-wrap: balance;
 }
-.intro p {
-  margin: 0;
-  max-width: 42ch;
-  font-size: 17px;
-  line-height: 1.55;
-  color: var(--ink-muted);
-  text-wrap: pretty;
-}
 .join {
+  --gutter: clamp(24px, 5vw, 80px);
+  align-self: center;
+  justify-self: center;
+  width: 100%;
+  max-width: calc(400px + 2 * var(--gutter));
+  padding: 48px var(--gutter);
   display: grid;
-  gap: 12px;
-  padding: 28px;
-  background: var(--peach-soft);
-  border: 1px solid var(--peach-line);
-  border-radius: var(--radius-container);
-  box-shadow: var(--shadow);
+  gap: 10px;
 }
 label {
   font-size: 14px;
@@ -203,6 +198,12 @@ input::placeholder {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+.join > .actions {
+  margin-top: 6px;
+}
+#connect {
+  flex: 1;
 }
 button {
   font: inherit;
@@ -273,9 +274,8 @@ summary:hover {
   color: var(--ink);
 }
 #advanced {
-  margin-top: 4px;
   padding-top: 16px;
-  border-top: 1px solid var(--peach-line);
+  border-top: 1px solid var(--line);
 }
 #test-tools {
   padding-top: 8px;
@@ -302,28 +302,20 @@ summary:hover {
 .test-pairing:empty {
   display: none;
 }
-footer {
-  font-size: 13px;
-  color: var(--ink-muted);
-}
 @media (max-width: 767px) {
   .pairing {
-    gap: 24px;
-    padding: 20px 16px 20px;
-  }
-  .columns {
     grid-template-columns: 1fr;
-    gap: 28px;
-    align-items: start;
+    grid-template-rows: auto 1fr;
   }
-  .intro h1 {
-    margin-bottom: 12px;
-  }
-  .intro p {
-    font-size: 16px;
+  .intro {
+    gap: 40px;
+    padding: 20px 16px 28px;
   }
   .join {
-    padding: 20px;
+    --gutter: 16px;
+    align-self: start;
+    padding-top: 28px;
+    padding-bottom: 32px;
   }
   #code {
     height: 68px;

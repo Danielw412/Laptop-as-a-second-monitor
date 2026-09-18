@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta name="referrer" content="no-referrer" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbf7f3" />
-    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1b1512" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#664930" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#4a3424" />
     <meta
       name="description"
       content="Turn this laptop into a second screen for a Windows PC running Laptop Monitor. Enter the pairing code and the display fills this window."
@@ -19,67 +19,51 @@
   </head>
   <body>
     <main id="pairing" class="pairing">
-      <header class="brand"><span class="mark" aria-hidden="true"></span>Laptop Monitor</header>
-      <div class="columns">
-        <section class="intro">
-          <h1>Your second screen, in a browser.</h1>
-          <p>
-            Start Laptop Monitor on the Windows PC and type the six-character code it shows. The virtual display
-            then fills this screen.
-          </p>
-        </section>
-        <form id="join" class="join" novalidate>
-          <label for="code">Pairing code</label>
+      <section class="intro">
+        <header class="brand"><span class="mark" aria-hidden="true"></span>Laptop Monitor</header>
+        <h1>Use your laptop as a monitor</h1>
+      </section>
+      <form id="join" class="join" novalidate>
+        <label for="code">Pairing code</label>
+        <input
+          id="code"
+          required
+          maxlength="6"
+          placeholder="K7M4Q2"
+          autocomplete="one-time-code"
+          inputmode="text"
+          autocapitalize="characters"
+          spellcheck="false"
+          autofocus
+        />
+        <div class="actions">
+          <button id="connect" type="submit" class="primary">Connect display</button>
+          <button id="cancel" type="button" class="quiet" hidden>Cancel</button>
+        </div>
+        <p id="message" class="message" role="status" aria-live="polite"></p>
+        <details id="advanced">
+          <summary>Advanced</summary>
+          <label for="server">Signaling server</label>
           <input
-            id="code"
+            id="server"
+            type="url"
             required
-            maxlength="6"
-            placeholder="K7M4Q2"
-            autocomplete="one-time-code"
-            inputmode="text"
-            autocapitalize="characters"
-            spellcheck="false"
-            autofocus
+            placeholder="https://browser-monitor-signaling.example.workers.dev"
+            autocomplete="url"
           />
-          <p id="message" class="message" role="status" aria-live="polite"></p>
-          <div class="actions">
-            <button id="connect" type="submit" class="primary">Connect display</button>
-            <button id="cancel" type="button" class="quiet" hidden>Cancel</button>
-          </div>
-          <p class="hint">A new code appears every two minutes. A connection that is already up keeps running.</p>
-          <details id="advanced">
-            <summary>Advanced</summary>
-            <label for="server">Signaling server</label>
-            <input
-              id="server"
-              type="url"
-              required
-              placeholder="https://browser-monitor-signaling.example.workers.dev"
-              autocomplete="url"
-            />
-            <p class="hint">
-              The signaling server only introduces the two computers; video travels directly between them. The
-              address is remembered on this device.
-            </p>
-            <label class="check"
-              ><input id="auto-fullscreen" type="checkbox" checked />Fill the screen when the display connects</label
-            >
-            <details id="test-tools">
-              <summary>Sender test (for developers)</summary>
-              <p class="hint">
-                Streams from this browser instead of the native host, to test pairing and WebRTC. It publishes a
-                one-off code for two minutes.
-              </p>
-              <div class="actions">
-                <button id="test-host" type="button">Share a screen</button>
-                <button id="test-pattern" type="button">Stream test pattern</button>
-              </div>
-              <output id="test-pairing" class="test-pairing"></output>
-            </details>
+          <label class="check"
+            ><input id="auto-fullscreen" type="checkbox" checked />Fill the screen when the display connects</label
+          >
+          <details id="test-tools">
+            <summary>Sender test (for developers)</summary>
+            <div class="actions">
+              <button id="test-host" type="button">Share a screen</button>
+              <button id="test-pattern" type="button">Stream test pattern</button>
+            </div>
+            <output id="test-pairing" class="test-pairing"></output>
           </details>
-        </form>
-      </div>
-      <footer>Video goes straight from the PC to this laptop over WebRTC. Nothing passes through a server.</footer>
+        </details>
+      </form>
     </main>
     <section id="stage" class="stage" hidden aria-label="Virtual display">
       <video id="video" autoplay playsinline muted disablepictureinpicture disableremoteplayback></video>
