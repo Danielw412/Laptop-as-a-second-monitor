@@ -56,12 +56,27 @@ Edge or Safari on the other laptop.
 1. Start **Laptop Monitor** (or let it start at sign-in from Settings). It goes through *Starting virtual display →
    Finding LaptopMon → Starting encoder → Connecting signaling → Ready for receiver* in a few seconds.
 2. Read the **pairing code** on the Overview page (or right-click the tray icon → *Copy pairing code*).
-3. On the other laptop, open the receiver page and enter the code. The stream starts; the app shows **Connected**
-   with live FPS, bitrate, RTT, dropped frames, resolution and encoder.
+3. On the other laptop, open the receiver page and type the code. The sixth character connects; the page moves
+   to the display and fills the screen. The app shows **Connected** with live FPS, bitrate, RTT, dropped frames,
+   resolution and encoder.
 
 Only the code has to be typed. If the receiver runs against its own signaling worker, set it once under *Advanced*:
 the address is kept in a cookie (with localStorage as a fallback) scoped to that page, so it comes back on every
-later visit. A `#server=` link overrides it and replaces what was stored.
+later visit. A `#server=` link overrides it and replaces what was stored. **Copy link** in the app puts a receiver
+link with the current code on the clipboard (`…/#code=K7M4Q2`); opened on the other laptop, it connects on its
+own. The code only ever travels in the URL fragment, which browsers never send to a server.
+
+### Receiver
+
+The page has two states: the code page and the display. Once the code is accepted it switches to the display and
+asks the browser for fullscreen (turn that off under *Advanced* if you prefer a window). While a picture is
+showing, the cursor and the small toolbar disappear after 2.5 seconds without mouse movement and come back on any
+movement. **F** toggles fullscreen, **S** opens the connection and performance panel, **Esc** leaves fullscreen,
+and a click on the picture fills the screen when it is not already full (the browser only allows fullscreen from
+a click or key press, so a reloaded page waits for one). The page holds a screen wake lock while the display is
+connected, so the receiving laptop does not dim or sleep under you. A reload or a short signaling drop reconnects
+by itself with the session token; *Disconnect* in the toolbar returns to the code page, and so does being
+disconnected from the host.
 
 LaptopMon is found by its EDID identity (manufacturer `LMV`, product `0001`, name `LaptopMon`), never by its
 `\\.\DISPLAYn` number, which Windows reassigns. Laptop Monitor never falls back to a physical display: if
@@ -87,27 +102,30 @@ Windows *draws* on that display, which is what makes it readable on a 13-inch re
 
 | Action | What it does |
 | --- | --- |
+| **Copy code** / **Copy link** | Puts the pairing code, or the receiver link that carries it and connects on open, on the clipboard. |
 | **Disconnect receiver** | Drops the current viewer (server-side too), issues a fresh code, keeps streaming ready. |
 | **Stop streaming** / **Start streaming** | Stops the encoder and signaling; the virtual display stays as a plain desktop extension. |
 | **Stop monitor** / **Start monitor** | Stops streaming and removes the virtual display. The app stays in the tray. |
 | **Restart** | Full restart: display, encoder and signaling. |
 | **Exit Laptop Monitor** | Stops streaming, removes the virtual display, stops the helper, removes the tray icon and exits. |
 
-Keyboard: Tab / Shift+Tab move focus, Enter or Space activates, ←/→ switch pages, Ctrl+C copies the code, Esc
-hides the window to the tray.
+Keyboard: Tab / Shift+Tab move focus, Enter or Space activates, ←/→ switch pages, Ctrl+C copies the code,
+Ctrl+Shift+C copies the receiver link, Esc hides the window to the tray.
 
 ### Tray
 
 Closing the window hides Laptop Monitor to the tray (Settings → *Keep running in the tray when the window
 closes*; turn it off to make the close button exit). Left-click the tray icon to show or hide the window;
-right-click for *Open*, *Copy pairing code*, *Disconnect receiver*, *Stop/Start streaming*, *Stop/Start monitor*,
-*Restart* and *Exit Laptop Monitor*. The icon's dot shows the state: green ready, blue connected, amber busy or
-reconnecting, red error, grey stopped. A balloon appears when the receiver connects or leaves.
+right-click for *Open*, *Copy pairing code*, *Copy receiver link*, *Disconnect receiver*, *Stop/Start streaming*,
+*Stop/Start monitor*, *Restart* and *Exit Laptop Monitor*. The icon's dot shows the state: green ready, blue
+connected, amber busy or reconnecting, red error, grey stopped. A balloon appears when the receiver connects or
+leaves.
 
 ### Pages
 
-- **Overview**: pairing code with countdown, four status rows (virtual display, streaming, receiver, signaling),
-  six headline metrics, the controls above.
+- **Overview**: pairing code with countdown and the two copy buttons, a link to the receiver page (opened from
+  here it carries the current code), four status rows (virtual display, streaming, receiver, signaling), six
+  headline metrics, the controls above.
 - **Details**: capture/encode/receiver FPS, encoder and receiver bitrate, RTT, jitter, packet loss, dropped frames,
   capture, encode and frame-to-encoded latency (measured from the compositor's own frame stamp), how long frames
   waited before capture, the receiver's jitter-buffer and decode delay, encoder queue and keyframes, connection
@@ -183,6 +201,9 @@ Two things are deliberately not carried over:
 
 ## Development
 
+`AGENTS.md` is the map: what each directory is for, how the parts talk to each other, the rules that are not
+visible in the code, and where to change what.
+
 ```
 host/include, host/src   pipeline (capture, converter, encoder, wgc, transport), logic (pairing, display_identity,
                           app_state, settings, logging), display_query, pipeline (StreamingEngine)
@@ -193,7 +214,8 @@ host/bench                laptop-monitor-bench.exe
 host/tests                core-tests (bitrate, samples, H.264 framing), logic-tests (pairing, detection, lifecycle,
                           settings, SHA-256)
 shared/protocol.ts        signaling message schema shared by worker and receiver
-signaling/, viewer/       Cloudflare Worker and receiver page
+signaling/, viewer/       Cloudflare Worker and receiver page (viewer/src: main = views, stage = the display,
+                          session = signaling + WebRTC, dashboard + telemetry = metrics, preferences = storage)
 docs/                     logging-reference.md: what every logged field means, for performance work
 tests/                    vitest (protocol, telemetry) and the signaling integration test
 ```

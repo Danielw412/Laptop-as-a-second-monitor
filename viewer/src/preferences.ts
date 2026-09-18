@@ -97,3 +97,31 @@ export function forgetServer(): void {
     /* Storage disabled by browser policy. */
   }
 }
+
+/**
+ * Whether the stage asks for fullscreen as soon as the display connects. On by default: a second monitor is
+ * meant to fill the screen, and the browser's own fullscreen exit (Esc) is always one key away. Off is a plain
+ * localStorage flag; a blocked store just means the default comes back.
+ */
+const FULLSCREEN_KEY = "lm_auto_fullscreen";
+
+/** Parses the stored flag: only an explicit "off" turns it off. Exported for tests. */
+export function parseAutoFullscreen(stored: string | null | undefined): boolean {
+  return stored !== "off";
+}
+
+export function autoFullscreen(): boolean {
+  try {
+    return parseAutoFullscreen(localStorage.getItem(FULLSCREEN_KEY));
+  } catch {
+    return true;
+  }
+}
+
+export function rememberAutoFullscreen(on: boolean): void {
+  try {
+    localStorage.setItem(FULLSCREEN_KEY, on ? "on" : "off");
+  } catch {
+    /* Storage disabled by browser policy. */
+  }
+}

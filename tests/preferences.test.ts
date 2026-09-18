@@ -1,5 +1,5 @@
 import { it, expect } from "vitest";
-import { parseCookies, usableSignalingUrl } from "../viewer/src/preferences";
+import { parseAutoFullscreen, parseCookies, usableSignalingUrl } from "../viewer/src/preferences";
 
 it("reads a percent-encoded value back out of a cookie header", () => {
   const header = "other=1; lm_signaling_url=https%3A%2F%2Fexample.workers.dev; last=2";
@@ -24,4 +24,11 @@ it("refuses a stored value the session would reject anyway", () => {
 });
 it("drops a query and fragment so the stored address is just the server", () => {
   expect(usableSignalingUrl("https://example.workers.dev/room?x=1#y")).toBe("https://example.workers.dev/room");
+});
+it("fills the screen unless that was explicitly turned off", () => {
+  expect(parseAutoFullscreen(null)).toBe(true);
+  expect(parseAutoFullscreen(undefined)).toBe(true);
+  expect(parseAutoFullscreen("on")).toBe(true);
+  expect(parseAutoFullscreen("garbage")).toBe(true);
+  expect(parseAutoFullscreen("off")).toBe(false);
 });

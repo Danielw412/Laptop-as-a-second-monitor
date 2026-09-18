@@ -25,6 +25,7 @@ class MainWindow {
         TabDetails,
         TabSettings,
         CopyCode,
+        CopyLink,
         DisconnectViewer,
         ToggleStream,
         ToggleMonitor,
@@ -69,6 +70,7 @@ class MainWindow {
     bool startHidden_, exitTimerArmed_ = false, tracking_ = false, destroying_ = false;
     float dpi_ = 96.f;
     std::wstring toast_;
+    Id toastTarget_ = Id::None; // Which button shows toast_ in place of its label
     UINT taskbarCreated_ = 0;
     HICON icons_[6]{};
     int lastIcon_ = -1;
@@ -102,7 +104,13 @@ class MainWindow {
     void trayMenu();
     void updateTray();
     void copyCode();
+    void copyLink();
     void copyDiagnostics();
+    void copyToClipboard(const std::wstring &text, const wchar_t *toast, Id target);
+    /// The receiver page, with the current pairing code in the fragment when there is one, so it connects on open.
+    std::string viewerLink() const;
+    /// A control's label, or the toast while this control is the one showing it.
+    std::wstring labelFor(Id id, const wchar_t *label) const;
     void chooseSetting(Id, const D2D1_RECT_F &anchor);
     void applyUrlFromEdit();
     void syncUrlEdit();
