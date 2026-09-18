@@ -4,80 +4,106 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta name="referrer" content="no-referrer" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbf7f3" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1b1512" />
+    <meta
+      name="description"
+      content="Turn this laptop into a second screen for a Windows PC running Laptop Monitor. Enter the pairing code and the display fills this window."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23664930'/%3E%3Crect x='7' y='9' width='18' height='12' rx='2.5' fill='%23ffdbbb'/%3E%3Crect x='5' y='22' width='22' height='2' rx='1' fill='%23ffdbbb'/%3E%3C/svg%3E"
+    />
     <title>Laptop Monitor</title>
   </head>
   <body>
-    <header>
-      <strong>Laptop Monitor</strong
-      ><span id="status" role="status">Ready to connect</span
-      ><button id="fullscreen" disabled>Fullscreen</button
-      ><button id="disconnect" disabled>Disconnect</button>
-    </header>
-    <main>
-      <section id="pairing">
-        <h1>Your second screen.<br />In a browser.</h1>
-        <p>
-          Start Laptop Monitor on your Windows PC and enter the six-character
-          code it shows. The code changes every two minutes; the connection
-          stays up.
-        </p>
-        <form id="join">
-          <label class="code-label"
-            >Pairing code<input
-              id="code"
-              required
-              maxlength="6"
-              pattern="[A-HJ-NP-Z2-9]{6}"
-              placeholder="K7M4Q2"
-              autocomplete="one-time-code"
-              inputmode="text"
-              autocapitalize="characters"
-              spellcheck="false"
-              autofocus
-          /></label>
-          <button type="submit">Connect display</button>
+    <main id="pairing" class="pairing">
+      <header class="brand"><span class="mark" aria-hidden="true"></span>Laptop Monitor</header>
+      <div class="columns">
+        <section class="intro">
+          <h1>Your second screen, in a browser.</h1>
+          <p>
+            Start Laptop Monitor on the Windows PC and type the six-character code it shows. The virtual display
+            then fills this screen.
+          </p>
+        </section>
+        <form id="join" class="join" novalidate>
+          <label for="code">Pairing code</label>
+          <input
+            id="code"
+            required
+            maxlength="6"
+            placeholder="K7M4Q2"
+            autocomplete="one-time-code"
+            inputmode="text"
+            autocapitalize="characters"
+            spellcheck="false"
+            autofocus
+          />
+          <p id="message" class="message" role="status" aria-live="polite"></p>
+          <div class="actions">
+            <button id="connect" type="submit" class="primary">Connect display</button>
+            <button id="cancel" type="button" class="quiet" hidden>Cancel</button>
+          </div>
+          <p class="hint">A new code appears every two minutes. A connection that is already up keeps running.</p>
           <details id="advanced">
             <summary>Advanced</summary>
-            <label
-              >Signaling server<input
-                id="server"
-                type="url"
-                required
-                placeholder="https://browser-monitor-signaling.…workers.dev"
-                autocomplete="url"
-            /></label>
-            <p class="metrics-note">
-              Signaling only coordinates the connection. Video travels directly
-              between the two computers over WebRTC. This address is remembered
-              on this device, so you only enter it once.
+            <label for="server">Signaling server</label>
+            <input
+              id="server"
+              type="url"
+              required
+              placeholder="https://browser-monitor-signaling.example.workers.dev"
+              autocomplete="url"
+            />
+            <p class="hint">
+              The signaling server only introduces the two computers; video travels directly between them. The
+              address is remembered on this device.
             </p>
+            <label class="check"
+              ><input id="auto-fullscreen" type="checkbox" checked />Fill the screen when the display connects</label
+            >
+            <details id="test-tools">
+              <summary>Sender test (for developers)</summary>
+              <p class="hint">
+                Streams from this browser instead of the native host, to test pairing and WebRTC. It publishes a
+                one-off code for two minutes.
+              </p>
+              <div class="actions">
+                <button id="test-host" type="button">Share a screen</button>
+                <button id="test-pattern" type="button">Stream test pattern</button>
+              </div>
+              <output id="test-pairing" class="test-pairing"></output>
+            </details>
           </details>
         </form>
-        <details id="test-tools">
-          <summary>Browser sender test</summary>
-          <p>
-            Use this on the sending PC to test pairing and WebRTC before running
-            the native host. It publishes a one-off code for two minutes.
-          </p>
-          <button id="test-host">Share a screen</button
-          ><button id="test-pattern">Stream test pattern</button
-          ><output id="test-pairing"></output>
-        </details>
-      </section>
-      <section id="screen" hidden>
-        <video id="video" autoplay playsinline muted></video
-        ><button id="play" hidden>Play display</button>
-      </section>
-      <pre id="error" role="alert"></pre>
+      </div>
+      <footer>Video goes straight from the PC to this laptop over WebRTC. Nothing passes through a server.</footer>
     </main>
-    <footer>
-      <span>Direct WebRTC · No media relay</span>
-      <details id="dashboard">
-        <summary>Connection & performance</summary>
+    <section id="stage" class="stage" hidden aria-label="Virtual display">
+      <video id="video" autoplay playsinline muted disablepictureinpicture disableremoteplayback></video>
+      <div id="overlay" class="overlay">
+        <p id="stage-status" class="stage-status" role="status" aria-live="polite"></p>
+        <pre id="stage-error" class="stage-error" role="alert" hidden></pre>
+        <button id="play" type="button" class="primary" hidden>Play display</button>
+      </div>
+      <div id="toolbar" class="toolbar">
+        <span id="toolbar-note" class="note" hidden></span>
+        <button id="stats" type="button" aria-pressed="false" aria-keyshortcuts="s" title="Connection and performance (S)">
+          Stats
+        </button>
+        <button id="fullscreen" type="button" aria-keyshortcuts="f" title="Fullscreen (F)">Fullscreen</button>
+        <button id="disconnect" type="button">Disconnect</button>
+      </div>
+      <aside id="dashboard" class="dashboard" hidden aria-label="Connection and performance">
         <div id="dashboard-grid"></div>
-        <p class="metrics-note">— = unavailable. Stages are elapsed from this signaling attempt. Host metrics expire after 3.5 seconds. The session stays in this tab until you disconnect or close it.</p>
-      </details>
-    </footer>
+        <p class="hint">
+          n/a means the browser does not report that value. Host figures expire 3.5 seconds after the last update.
+          Stage times count from the latest signaling attempt.
+        </p>
+      </aside>
+    </section>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

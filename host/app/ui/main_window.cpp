@@ -15,7 +15,7 @@ constexpr float kInner = kRight - kMargin;
 constexpr UINT_PTR TIMER_EXIT = 4;
 constexpr UINT_PTR TIMER_METRICS = 5;
 constexpr UINT IDM_TRAY_OPEN = 1, IDM_TRAY_COPY = 2, IDM_TRAY_DISCONNECT = 3, IDM_TRAY_STREAM = 4,
-               IDM_TRAY_MONITOR = 5, IDM_TRAY_RESTART = 6, IDM_TRAY_EXIT = 7;
+               IDM_TRAY_MONITOR = 5, IDM_TRAY_RESTART = 6, IDM_TRAY_EXIT = 7, IDM_TRAY_COPY_LINK = 8;
 constexpr UINT IDC_URL = 100;
 D2D1_RECT_F rect(float x, float y, float w, float h) {
     return D2D1::RectF(x, y, x + w, y + h);
@@ -268,7 +268,8 @@ LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
             return 0;
         }
         if (w == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) {
-            copyCode();
+            // Ctrl+C is the code alone; Ctrl+Shift+C is the receiver link that carries it.
+            (GetKeyState(VK_SHIFT) & 0x8000) ? copyLink() : copyCode();
             return 0;
         }
         if (w == VK_LEFT || w == VK_RIGHT) {
@@ -293,6 +294,7 @@ LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
         else if (w == TIMER_TOAST) {
             KillTimer(hwnd_, TIMER_TOAST);
             toast_.clear();
+            toastTarget_ = Id::None;
             InvalidateRect(hwnd_, nullptr, FALSE);
         } else if (w == TIMER_EXIT) {
             KillTimer(hwnd_, TIMER_EXIT);
@@ -434,6 +436,7 @@ void MainWindow::trayMenu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     const auto code = controller_->pairingCode();
     AppendMenuW(menu, MF_STRING | (code.empty() ? MF_GRAYED : 0), IDM_TRAY_COPY, L"Copy pairing code");
+    AppendMenuW(menu, MF_STRING | (code.empty() ? MF_GRAYED : 0), IDM_TRAY_COPY_LINK, L"Copy receiver link");
     AppendMenuW(menu, MF_STRING | (m.viewer == ViewerStatus::None ? MF_GRAYED : 0), IDM_TRAY_DISCONNECT,
                 L"Disconnect receiver");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -461,6 +464,9 @@ void MainWindow::trayMenu() {
     case IDM_TRAY_COPY:
         copyCode();
         break;
+    case IDM_TRAY_COPY_LINK:
+        copyLink();
+        break;
     case IDM_TRAY_DISCONNECT:
         controller_->disconnectViewer();
         break;
@@ -480,26 +486,45 @@ void MainWindow::trayMenu() {
     }
 }
 // ---- Actions ---------------------------------------------------------------------------------------------------
-void MainWindow::copyCode() {
-    auto code = controller_->pairingCode();
-    if (code.empty())
-        return;
-    auto wide = widen(code);
+void MainWindow::copyToClipboard(const std::wstring &text, const wchar_t *toast, Id target) {
     if (OpenClipboard(hwnd_)) {
         EmptyClipboard();
-        auto bytes = (wide.size() + 1) * sizeof(wchar_t);
+        auto bytes = (text.size() + 1) * sizeof(wchar_t);
         if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
             if (void *p = GlobalLock(memory)) {
-                memcpy(p, wide.c_str(), bytes);
+                memcpy(p, text.c_str(), bytes);
                 GlobalUnlock(memory);
                 SetClipboardData(CF_UNICODETEXT, memory);
             }
         }
         CloseClipboard();
     }
-    toast_ = L"Copied";
+    toast_ = toast;
+    toastTarget_ = target;
     SetTimer(hwnd_, TIMER_TOAST, 1500, nullptr);
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+std::wstring MainWindow::labelFor(Id id, const wchar_t *label) const {
+    return toast_.empty() || toastTarget_ != id ? std::wstring(label) : toast_;
+}
+std::string MainWindow::viewerLink() const {
+    std::string url = kViewerUrl;
+    if (auto code = controller_->pairingCode(); !code.empty())
+        url += "#code=" + code;
+    return url;
+}
+void MainWindow::copyCode() {
+    auto code = controller_->pairingCode();
+    if (code.empty())
+        return;
+    copyToClipboard(widen(code), L"Copied", Id::CopyCode);
+}
+void MainWindow::copyLink() {
+    // Paste it on the other laptop (cloud clipboard, a chat, anything) and the receiver connects on open: the
+    // code rides in the fragment, which never reaches a server.
+    if (controller_->pairingCode().empty())
+        return;
+    copyToClipboard(widen(viewerLink()), L"Link copied", Id::CopyLink);
 }
 void MainWindow::copyDiagnostics() {
     const auto &m = controller_->model();
@@ -530,21 +555,7 @@ void MainWindow::copyDiagnostics() {
     text += "Recent log (codes and credentials are never logged):\n";
     for (auto &line : controller_->recentLog())
         text += line + "\n";
-    auto wide = widen(text);
-    if (OpenClipboard(hwnd_)) {
-        EmptyClipboard();
-        auto bytes = (wide.size() + 1) * sizeof(wchar_t);
-        if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-            if (void *p = GlobalLock(memory)) {
-                memcpy(p, wide.c_str(), bytes);
-                GlobalUnlock(memory);
-                SetClipboardData(CF_UNICODETEXT, memory);
-            }
-        }
-        CloseClipboard();
-    }
-    toast_ = L"Diagnostics copied";
-    SetTimer(hwnd_, TIMER_TOAST, 1500, nullptr);
+    copyToClipboard(widen(text), L"Diagnostics copied", Id::CopyDiagnostics);
 }
 void MainWindow::applyUrlFromEdit() {
     if (!urlEdit_)
@@ -633,6 +644,9 @@ void MainWindow::activate(Id id) {
     case Id::CopyCode:
         copyCode();
         break;
+    case Id::CopyLink:
+        copyLink();
+        break;
     case Id::DisconnectViewer:
         controller_->disconnectViewer();
         break;
@@ -673,7 +687,7 @@ void MainWindow::activate(Id id) {
         copyDiagnostics();
         break;
     case Id::OpenViewer:
-        ShellExecuteW(hwnd_, L"open", widen(kViewerUrl).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ShellExecuteW(hwnd_, L"open", widen(viewerLink()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         break;
     case Id::SetStartAtSignIn:
         settings.startAtSignIn = !settings.startAtSignIn;
@@ -939,7 +953,10 @@ void MainWindow::drawOverview() {
                        Align::Left, true, 1.2f);
         renderer_.text(widen(code), rect(card.left + 18, card.top + 32, 250, 54), Font::Code, t.accent, Align::Left,
                        true, 7.f);
-        add(Id::CopyCode, rect(card.right - 82, card.top + 42, 62, 32), toast_.empty() ? L"Copy" : toast_,
+        // Two ways to hand the code over: the code itself, or a receiver link that carries it and connects on open.
+        add(Id::CopyCode, rect(card.right - 104, card.top + 33, 84, 30), labelFor(Id::CopyCode, L"Copy code"),
+            Kind::Button);
+        add(Id::CopyLink, rect(card.right - 104, card.top + 67, 84, 30), labelFor(Id::CopyLink, L"Copy link"),
             Kind::Button);
         const int left = controller_->pairingSecondsLeft();
         auto track = rect(card.left + 20, card.top + 104, kInner - 40, 4);
@@ -1168,7 +1185,8 @@ void MainWindow::drawDetails() {
     }
     renderer_.line(kMargin, 604, kRight, 604, t.divider);
     const float bw = (kInner - 8) / 2;
-    add(Id::CopyDiagnostics, rect(kMargin, 616, bw, 32), toast_.empty() ? L"Copy diagnostics" : toast_, Kind::Button);
+    add(Id::CopyDiagnostics, rect(kMargin, 616, bw, 32), labelFor(Id::CopyDiagnostics, L"Copy diagnostics"),
+        Kind::Button);
     add(Id::OpenLogs, rect(kMargin + bw + 8, 616, bw, 32), L"Open log folder", Kind::Button);
 }
 void MainWindow::drawSettings() {

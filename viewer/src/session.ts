@@ -14,6 +14,20 @@ export type Credentials =
   | { role: "viewer"; room: string; token: string }
   | { role: "host"; room: string; secret: string; code: string };
 export type Paired = { room?: string; token?: string };
+/**
+ * Where the session is, as the page needs to know it: still exchanging the code ("pairing"), past pairing but
+ * without a picture yet or with one that dropped ("busy"), or showing live video ("connected").
+ */
+export type SessionPhase = "pairing" | "busy" | "connected";
+export interface SessionHandlers {
+  status(text: string): void;
+  error(text: string): void;
+  video(stream: MediaStream): void;
+  diagnostics(payload: unknown): void;
+  phase?(phase: SessionPhase): void;
+  paired?(p: Paired): void;
+  ended?(reason: string): void;
+}
 export const ERROR_TEXT: Record<string, string> = {
   "invalid-code": "That code was not recognized or has expired. Check the code shown in Laptop Monitor and try again.",
   "rate-limit": "Too many attempts. Wait a minute, then enter the current code.",
@@ -22,6 +36,15 @@ export const ERROR_TEXT: Record<string, string> = {
   malformed: "The signaling server rejected a message.",
   role: "The signaling server rejected a message.",
   version: "This receiver and the signaling server speak different protocol versions.",
+};
+/** What each WebRTC connection state means to the person watching. */
+const CONNECTION_TEXT: Record<RTCPeerConnectionState, string | undefined> = {
+  new: undefined,
+  connecting: "Connecting directly…",
+  connected: "Connected",
+  disconnected: "Connection interrupted. Reconnecting…",
+  failed: "Direct connection failed. Retrying…",
+  closed: "Connection closed",
 };
 export class Session {
   private ws?: WebSocket;
@@ -40,8 +63,9 @@ export class Session {
   private iceStarted?: number;
   private room?: string;
   private token?: string;
+  private lastPhase?: SessionPhase;
   private connectionStats(resetPeer = false) {
-    this.diagnostics({ type: "connection-stats", ...this.stages,
+    this.on.diagnostics({ type: "connection-stats", ...this.stages,
       state: this.pc?.connectionState ?? "new", ice: this.pc?.iceConnectionState,
       resetPeer });
   }
@@ -49,16 +73,16 @@ export class Session {
     if (this.stages[name] === undefined) this.stages[name] = performance.now() - this.started;
     this.connectionStats();
   }
+  private phase(p: SessionPhase) {
+    if (p === this.lastPhase) return;
+    this.lastPhase = p;
+    this.on.phase?.(p);
+  }
   presented() { this.mark("firstVideoMs"); }
   constructor(
     private server: string,
     private credentials: Credentials,
-    private status: (s: string) => void,
-    private error: (s: string) => void,
-    private video: (s: MediaStream) => void,
-    private diagnostics: (s: unknown) => void,
-    private paired: (p: Paired) => void = () => {},
-    private ended: (reason: string) => void = () => {},
+    private on: SessionHandlers,
     private stream?: MediaStream,
   ) {
     if ("room" in credentials) this.room = credentials.room;
@@ -88,13 +112,17 @@ export class Session {
     this.connectionStats(true);
     const url = this.signalingUrl();
     // A token outlives the code it was obtained with, so resuming prefers it over the code.
-    if (this.room && (this.token || this.credentials.role === "host")) this.open(url, undefined);
-    else if (this.credentials.role === "viewer" && "code" in this.credentials) void this.pair(url, this.credentials.code);
-    else throw Error("Enter the pairing code shown in Laptop Monitor.");
+    if (this.room && (this.token || this.credentials.role === "host")) {
+      this.phase("busy");
+      this.open(url, undefined);
+    } else if (this.credentials.role === "viewer" && "code" in this.credentials) {
+      this.phase("pairing");
+      void this.pair(url, this.credentials.code);
+    } else throw Error("Enter the pairing code shown in Laptop Monitor.");
   }
   /** Exchanges the code for a room and a one-time ticket. The code travels in a request body, never in a URL. */
   private async pair(url: URL, code: string) {
-    this.status("Checking the pairing code…");
+    this.on.status("Checking the pairing code…");
     const attempt = this.started;
     let result: PairResponse;
     try {
@@ -106,23 +134,24 @@ export class Session {
       result = (await response.json()) as PairResponse;
     } catch {
       if (this.stopped || attempt !== this.started) return;
-      this.error("Signaling connection failed. Check the server URL and network.");
+      this.on.error("Signaling connection failed. Check the server URL and network.");
       this.scheduleRetry();
       return;
     }
     if (this.stopped || attempt !== this.started) return;
     if ("error" in result) {
       if (result.error === "host-unavailable") {
-        this.status("Laptop Monitor is not running on the host yet. Waiting…");
+        this.on.status("Laptop Monitor is not running on the host yet. Waiting…");
         this.scheduleRetry();
         return;
       }
-      this.error(ERROR_TEXT[result.error] ?? `Pairing failed: ${result.error}`);
+      this.on.error(ERROR_TEXT[result.error] ?? `Pairing failed: ${result.error}`);
       this.stop();
-      this.ended(result.error);
+      this.on.ended?.(result.error);
       return;
     }
     this.room = result.room;
+    this.phase("busy");
     this.open(url, result.ticket);
   }
   private scheduleRetry() {
@@ -134,7 +163,7 @@ export class Session {
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = `/room/${this.room}`;
     const ws = (this.ws = new WebSocket(url));
-    this.status("Connecting to signaling…");
+    this.on.status("Connecting to signaling…");
     ws.onopen = () => {
       if (this.credentials.role === "host")
         ws.send(JSON.stringify({ type: "auth", version: 2, role: "host", secret: this.credentials.secret }));
@@ -148,17 +177,18 @@ export class Session {
           await this.message(JSON.parse(e.data) as ServerMessage);
         })
         .catch(() =>
-          this.error("Negotiation failed. Disconnect and reconnect to retry."),
+          this.on.error("Negotiation failed. Disconnect and reconnect to retry."),
         );
     };
     ws.onerror = () =>
-      this.error(
+      this.on.error(
         "Signaling connection failed. Check the server URL and network.",
       );
     ws.onclose = () => {
       if (this.ws !== ws || this.stopped) return;
       this.resetPeer();
-      this.status("Signaling disconnected. Reconnecting…");
+      this.phase("busy");
+      this.on.status("Signaling disconnected. Reconnecting…");
       this.scheduleRetry();
     };
   }
@@ -188,7 +218,7 @@ export class Session {
     channel.onmessage = (e) => {
       try {
         if (typeof e.data === "string" && e.data.length < 8192)
-          this.diagnostics(JSON.parse(e.data));
+          this.on.diagnostics(JSON.parse(e.data));
       } catch {
         /* Ignore non-JSON diagnostics. */
       }
@@ -197,7 +227,7 @@ export class Session {
   private async message(m: ServerMessage) {
     if (m.type === "error") {
       if (m.code === "host-unavailable") {
-        this.status("Laptop Monitor is not running on the host yet. Waiting…");
+        this.on.status("Laptop Monitor is not running on the host yet. Waiting…");
         this.ws?.close();
         return;
       }
@@ -208,26 +238,26 @@ export class Session {
         this.ws?.close();
         return;
       }
-      this.error(ERROR_TEXT[m.code] ?? `Pairing failed: ${m.code}`);
+      this.on.error(ERROR_TEXT[m.code] ?? `Pairing failed: ${m.code}`);
       this.stop();
-      this.ended(m.code);
+      this.on.ended?.(m.code);
       return;
     }
     if (m.type === "kicked") {
-      this.status("Disconnected by the host.");
-      this.error("");
+      this.on.status("Disconnected by the host.");
+      this.on.error("");
       this.stop();
-      this.ended("kicked");
+      this.on.ended?.("kicked");
       return;
     }
     if (m.type === "authenticated") {
       this.mark("signalingMs");
       this.retry = 0;
-      this.error("");
+      this.on.error("");
       if (m.role === "viewer" && m.token) {
         this.token = m.token;
         if (m.room) this.room = m.room;
-        this.paired({ room: this.room, token: m.token });
+        this.on.paired?.({ room: this.room, token: m.token });
       }
       if (this.credentials.role === "host") {
         this.ws?.send(
@@ -237,12 +267,13 @@ export class Session {
           }),
         );
       }
-      this.status(this.credentials.role === "host" ? "Code published. Waiting for the receiver…" : "Paired. Waiting for the host…");
+      this.on.status(this.credentials.role === "host" ? "Code published. Waiting for the receiver…" : "Paired. Waiting for the host…");
       return;
     }
     if (m.type === "peer-left") {
       this.resetPeer();
-      this.status("Other laptop disconnected. Waiting for it to return…");
+      this.phase("busy");
+      this.on.status("Other laptop disconnected. Waiting for it to return…");
       return;
     }
     if (m.type === "ready") {
@@ -256,7 +287,7 @@ export class Session {
         iceServers: ice.iceServers,
       }));
       const generation = m.generation;
-      this.status("Establishing direct connection…");
+      this.on.status("Establishing direct connection…");
       pc.oniceconnectionstatechange = () => {
         if (this.pc !== pc) return;
         if (pc.iceConnectionState === "checking" && this.iceStarted === undefined) this.iceStarted = performance.now();
@@ -282,18 +313,20 @@ export class Session {
           jitterBufferTarget?: number;
         };
         if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
-        this.video(e.streams[0] ?? new MediaStream([e.track]));
+        this.on.video(e.streams[0] ?? new MediaStream([e.track]));
       };
       pc.ondatachannel = (e) => this.data(e.channel);
       pc.onconnectionstatechange = () => {
         if (this.pc !== pc) return;
-        this.status(`WebRTC ${pc.connectionState}`);
+        const text = CONNECTION_TEXT[pc.connectionState];
+        if (text) this.on.status(text);
         this.connectionStats();
         if (pc.connectionState === "connected") {
           clearTimeout(this.deadline);
-          this.error("");
+          this.on.error("");
           this.mark("webrtcMs");
-        }
+          this.phase("connected");
+        } else if (pc.connectionState !== "new" && pc.connectionState !== "connecting") this.phase("busy");
         if (pc.connectionState === "failed") this.reconnectDirect();
         if (pc.connectionState === "disconnected") {
           clearTimeout(this.deadline);
@@ -316,7 +349,7 @@ export class Session {
           .sample(pc)
           .then((s) => {
             if (!s || this.pc !== pc) return;
-            this.diagnostics(s.diagnostics);
+            this.on.diagnostics(s.diagnostics);
             if (
               this.channel?.readyState === "open" &&
               this.channel.bufferedAmount < 4096
@@ -368,9 +401,10 @@ export class Session {
     }
   }
   private reconnectDirect() {
-    this.error(DIRECT_FAILURE);
+    this.on.error(DIRECT_FAILURE);
     this.stages.label = "Failed";
-    this.diagnostics({type: "connection-stats", ...this.stages, state: "failed", ice: this.pc?.iceConnectionState});
+    this.phase("busy");
+    this.on.diagnostics({type: "connection-stats", ...this.stages, state: "failed", ice: this.pc?.iceConnectionState});
     // Rejoining creates a fresh generation and triggers a new host offer.
     // Leave the failure visible before retrying; never substitute a relay.
     clearTimeout(this.retryTimer);

@@ -1,7 +1,7 @@
 type Metrics = Record<string, unknown>;
 const number = (v: unknown, unit = "", digits = 1) =>
-  typeof v === "number" && Number.isFinite(v) ? `${v.toFixed(digits)}${unit}` : "—";
-const text = (v: unknown) => typeof v === "string" ? v : "—";
+  typeof v === "number" && Number.isFinite(v) ? `${v.toFixed(digits)}${unit}` : "n/a";
+const text = (v: unknown) => typeof v === "string" ? v : "n/a";
 export class Dashboard {
   private connection: Metrics = {};
   private receiver: Metrics = {};
@@ -28,7 +28,7 @@ export class Dashboard {
     const c = this.connection, v = this.receiver;
     const h = performance.now() - this.hostAt < 3500 ? this.host : {};
     const route = typeof v.localCandidate === "string" && typeof v.remoteCandidate === "string"
-      ? `${v.localCandidate} ↔ ${v.remoteCandidate}` : "—";
+      ? `${v.localCandidate} to ${v.remoteCandidate}` : "n/a";
     const direct = c.state === "connected" && v.localCandidate && v.remoteCandidate &&
       v.localCandidate !== "relay" && v.remoteCandidate !== "relay";
     const groups: [string, [string, string][]][] = [
@@ -39,7 +39,7 @@ export class Dashboard {
         ["RTT", number(v.rttMs, " ms")],
       ]],
       ["Video", [
-        ["Resolution", v.width && v.height ? `${v.width}×${v.height}` : "—"],
+        ["Resolution", v.width && v.height ? `${v.width}×${v.height}` : "n/a"],
         ["Frame rate", number(v.fps, " FPS")],
         ["Received", number(typeof v.bitrate === "number" ? v.bitrate / 1e6 : null, " Mbps")],
         ["Codec", text(v.codec)], ["Packet loss", number(typeof v.loss === "number" ? v.loss * 100 : null, "%")],
