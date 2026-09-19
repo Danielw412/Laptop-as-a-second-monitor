@@ -131,7 +131,8 @@ leaves.
   waited before capture, the receiver's jitter-buffer and decode delay, encoder queue and keyframes, connection
   duration, sent frames/bytes, signaling and WebRTC state, GPU, encoder, capture backend, video path (GPU, no CPU
   readback), host CPU, setup status. *Copy diagnostics* puts all of it plus the drop breakdown, engine-thread cost,
-  process RAM/GPU memory and the recent log on the clipboard; *Open log folder* opens `%TEMP%\LaptopMonitor`.
+  process RAM/GPU memory, the run id and the recent log on the clipboard; *Open log folder* offers the current logs
+  (`%TEMP%\LaptopMonitor`), this run's archive, or all archived runs.
 - **Settings**: start at sign-in, start the virtual display automatically, keep running in the tray on close,
   diagnostics log, Windows scaling for LaptopMon only (see *Scaling*), capture backend (Auto prefers Windows Graphics Capture and falls back to DXGI duplication),
   frame rate (60/30), quality preset (Efficient 5→10 Mbps, Balanced 8→16 Mbps, Quality 12→20 Mbps), signaling URL
@@ -175,7 +176,8 @@ removes, in this order:
 1. the running helper and the scheduled task *Laptop Monitor Display*;
 2. `%ProgramFiles%\Laptop Monitor\`;
 3. the *start at sign-in* entry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\LaptopMonitor`);
-4. `%LOCALAPPDATA%\LaptopMonitor\` (settings, host credential) and `%TEMP%\LaptopMonitor\` (logs);
+4. `%LOCALAPPDATA%\LaptopMonitor\` (settings, host credential, archived diagnostics runs) and
+   `%TEMP%\LaptopMonitor\` (current logs);
 5. the driver package, the `SWD\LaptopMonitorIdd` device node and the local signing certificate, via
    `scripts/install-driver.ps1 -Uninstall` (when the scripts folder is found next to the build; otherwise the
    driver package is removed with `pnputil` and the certificate is left for `install-driver.ps1 -Uninstall`).
@@ -206,13 +208,15 @@ visible in the code, and where to change what.
 
 ```
 host/include, host/src   pipeline (capture, converter, encoder, wgc, transport), logic (pairing, display_identity,
-                          app_state, settings, logging), display_query, pipeline (StreamingEngine)
-host/app                  Win32 app: main, controller, display_control (helper client), setup, ui/ (Direct2D window,
-                          renderer, tray)
+                          app_state, settings, logging, session_archive), display_query, resources, pipeline
+                          (StreamingEngine)
+host/app                  Win32 app: main, controller, diagnostics (log and archive lifecycle), display_control
+                          (helper client), setup, ui/ (Direct2D window, renderer, tray)
 host/helper               LaptopMonitorDisplay.exe
 host/bench                laptop-monitor-bench.exe
-host/tests                core-tests (bitrate, samples, H.264 framing), logic-tests (pairing, detection, lifecycle,
-                          settings, SHA-256)
+host/tests                core-tests (bitrate, samples, latency and source-activity tracking, GPU busy share, H.264
+                          framing), logic-tests (pairing, detection, lifecycle, settings, SHA-256, logging, the
+                          per-run archive)
 shared/protocol.ts        signaling message schema shared by worker and receiver
 signaling/, viewer/       Cloudflare Worker and receiver page (viewer/src: main = views, stage = the display,
                           session = signaling + WebRTC, dashboard + telemetry = metrics, preferences = storage)
@@ -236,7 +240,9 @@ tests/                    vitest (protocol, telemetry) and the signaling integra
   bitrate between the preset's minimum and maximum every N seconds to check whether a live change takes effect
   (watch `frame_bytes_mean`). Per-second JSON/CSV columns include `acquire_delay_ms` (compositor stamp to
   capture), `source_to_encoded_ms`, `wakeups_per_s`, `loop_max_ms`, `submit_interval_ms`, `send_ms`,
-  `frame_bytes_max`, `keyframes` and the receiver's `jitterBufferMs`, `decodeMs` and `processingMs`.
+  `frame_bytes_max`, `keyframes` and the receiver's `jitterBufferMs`, `decodeMs` and `processingMs`; the JSON
+  lines also carry the host-clock latencies, source activity and GPU engine time described in the logging
+  reference. `--diagnostic-tag scrolling` labels every JSON line of a controlled run.
 
 ### How the frame loop is paced
 
@@ -253,8 +259,8 @@ keyframe interval is 10 s (keyframes are otherwise produced on demand: viewer jo
 
 ### Logging
 
-Everything is written to `%TEMP%\LaptopMonitor\` (*Open log folder* in Details goes straight there), on two
-channels, both governed by the *diagnostics log* setting and neither ever containing a pairing code or credential:
+The current logs are in `%TEMP%\LaptopMonitor\` (*Open log folder* in Details), on two channels, both governed by
+the *diagnostics log* setting and neither ever containing a pairing code or credential:
 
 - `host.log` (2 MB, rotates to `host.1.log`) - readable lines: startup with the machine profile and the settings in
   force, lifecycle and state changes, how long the virtual display and the pipeline took to build and where that
@@ -265,9 +271,17 @@ channels, both governed by the *diagnostics log* setting and neither ever contai
   sample: capture/encode rates and latencies with percentiles, the four drop causes counted apart (coalesced,
   superseded, ring busy, refused) plus paced frames, engine-thread wake-ups by reason and the share of wall time
   the thread was awake, keyframe versus delta frame size and encode cost, process CPU split into kernel and user
-  time, working set, GPU memory in use, handles, battery and battery-saver state, encoder rebuild count and cost,
-  the display re-enumeration stall, transport buffer pressure, the selected ICE route, and the receiver's own
+  time, working set, GPU memory in use, GPU engine busy time per engine class (this process and all processes),
+  handles, battery and battery-saver state, encoder rebuild count and cost, the display re-enumeration stall,
+  transport buffer pressure, the selected ICE route, where each frame's time goes on the host's own clock (capture
+  to conversion, encoder, encoded output and send), whether the source was still or stalled, and the receiver's own
   telemetry. This is the file to read when the question is "where is the CPU, GPU or memory going".
+
+Those rolling files are small and Temp gets cleaned, so every run with diagnostics on is also archived for good in
+`%LOCALAPPDATA%\LaptopMonitor\logs\sessions\<run_id>\`: the same `host.log` and `perf.jsonl` lines plus a
+`session.json` with the version, machine, GPU driver, settings, optional diagnostic tag and how the run ended
+(`graceful`, `abnormal` for a crash or forced exit, and so on). Nothing prunes the archive; uninstall removes it.
+Start the app with `--diagnostic-tag scrolling` (or any short label) to mark a controlled test in both.
 
 The per-second record is the same object the benchmark writes to its CSV and JSON sink, so a field measured in
 `benchmarks/` means the same thing in a user's log. `perf.jsonl` is written while the streaming engine runs; it

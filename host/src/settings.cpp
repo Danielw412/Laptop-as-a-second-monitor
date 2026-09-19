@@ -155,6 +155,10 @@ std::filesystem::path logDirectory() {
         return std::filesystem::path(value) / L"LaptopMonitor";
     return appDataDirectory() / L"logs"; // No usable TEMP: keep logging rather than lose it.
 }
+std::filesystem::path sessionsDirectory() {
+    // Durable, unlike Temp: each run's archive stays until uninstall or someone deletes it by hand.
+    return appDataDirectory() / L"logs" / L"sessions";
+}
 namespace {
 std::string generateSecret() {
     std::vector<UCHAR> bytes(32);

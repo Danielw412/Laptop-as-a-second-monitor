@@ -40,12 +40,18 @@ class AsyncCallback : public IMFAsyncCallback {
         return E_NOTIMPL;
     }
 };
+// One MFT event as the callback received it, with the host time it arrived.
+struct SignalledEvent {
+    MediaEventType type;
+    HRESULT status;
+    Clock::time_point at;
+};
 // State the encoder shares with its callbacks. It outlives the encoder object because Media Foundation may still
 // deliver a callback after shutdown.
 struct EncoderSignals {
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr); // Auto-reset: output, input demand or a freed slot
     std::mutex mutex;
-    std::deque<std::pair<MediaEventType, HRESULT>> events;
+    std::deque<SignalledEvent> events;
     std::atomic<bool> stopped{false};
     ~EncoderSignals() {
         if (event)
@@ -61,6 +67,7 @@ class EventSink final : public AsyncCallback {
     EventSink(std::shared_ptr<EncoderSignals> signals, ComPtr<IMFMediaEventGenerator> generator)
         : signals_(std::move(signals)), generator_(std::move(generator)) {}
     HRESULT STDMETHODCALLTYPE Invoke(IMFAsyncResult *result) override {
+        const auto at = Clock::now(); // When the MFT's event reached us: the start of the engine's pickup delay
         ComPtr<IMFMediaEvent> e;
         HRESULT hr = generator_->EndGetEvent(result, &e);
         if (signals_->stopped)
@@ -73,7 +80,7 @@ class EventSink final : public AsyncCallback {
         }
         {
             std::lock_guard lock(signals_->mutex);
-            signals_->events.emplace_back(type, status);
+            signals_->events.push_back({type, status, at});
         }
         SetEvent(signals_->event);
         if (SUCCEEDED(hr))
@@ -128,8 +135,15 @@ class MfEncoder final : public IEncoder {
     unsigned needs_ = 0, outputs_ = 0;
     struct Pending {
         int64_t submitted, presented;
+        FrameTrace trace;
     };
     std::map<int64_t, Pending> pending_;
+    // When each announced output was signalled, oldest first. An asynchronous MFT answers every HaveOutput event
+    // with exactly one ProcessOutput call, so these pair with outputs in order. If the ring ever filled, the
+    // outputs past it are counted in untimed_ and get no signal time instead of a wrong one.
+    std::array<Clock::time_point, 16> signalled_{};
+    size_t signalledFirst_ = 0, signalledCount_ = 0;
+    unsigned untimed_ = 0;
     // One tracked sample per input surface: no per-frame sample or buffer allocation, and the release callback
     // says exactly when the surface may be overwritten.
     struct Slot {
@@ -162,18 +176,35 @@ class MfEncoder final : public IEncoder {
         return SUCCEEDED(hr);
     }
     void pump() {
-        std::deque<std::pair<MediaEventType, HRESULT>> events;
+        std::deque<SignalledEvent> events;
         {
             std::lock_guard lock(signals_->mutex);
             events.swap(signals_->events);
         }
-        for (auto &[type, status] : events) {
+        for (auto &[type, status, at] : events) {
             check(status, "Async encoder");
             if (type == METransformNeedInput)
                 ++needs_;
-            if (type == METransformHaveOutput)
+            if (type == METransformHaveOutput) {
                 ++outputs_;
+                if (untimed_ || signalledCount_ == signalled_.size())
+                    ++untimed_;
+                else
+                    signalled_[(signalledFirst_ + signalledCount_++) % signalled_.size()] = at;
+            }
         }
+    }
+    /// The signal time of the output about to be retrieved, in the order the MFT announced them.
+    std::optional<Clock::time_point> nextSignalled() {
+        if (signalledCount_) {
+            const auto at = signalled_[signalledFirst_];
+            signalledFirst_ = (signalledFirst_ + 1) % signalled_.size();
+            --signalledCount_;
+            return at;
+        }
+        if (untimed_)
+            --untimed_;
+        return std::nullopt;
     }
     void readHeaders() {
         ComPtr<IMFMediaType> type;
@@ -321,7 +352,7 @@ class MfEncoder final : public IEncoder {
         pump();
         return needs_ > 0 && pending_.size() < maxInFlight_;
     }
-    bool submit(ID3D11Texture2D *texture, int64_t timestamp, int64_t presented) override {
+    bool submit(ID3D11Texture2D *texture, int64_t timestamp, int64_t presented, const FrameTrace &trace) override {
         if (!ready())
             return false;
         auto &slot = slotFor(texture);
@@ -353,7 +384,10 @@ class MfEncoder final : public IEncoder {
         }
         check(hr, "Encode GPU surface");
         --needs_;
-        pending_[timestamp] = {now100ns(), presented};
+        const auto submitted = Clock::now();
+        auto traced = trace;
+        traced.encodeSubmitted = submitted;
+        pending_[timestamp] = {to100ns(submitted), presented, traced};
         // Our reference ends here: the MFT's final release brings the sample back through Released::Invoke.
         return true;
     }
@@ -362,6 +396,7 @@ class MfEncoder final : public IEncoder {
         std::vector<Encoded> frames;
         while (outputs_) {
             --outputs_;
+            const auto signalled = nextSignalled();
             MFT_OUTPUT_STREAM_INFO info{};
             check(transform_->GetOutputStreamInfo(output_, &info), "H264 output requirements");
             ComPtr<IMFSample> allocated;
@@ -427,10 +462,14 @@ class MfEncoder final : public IEncoder {
                 throw;
             }
             buffer->Unlock();
+            frame.retrieved = Clock::now();
+            frame.outputSignalled = signalled;
             auto it = pending_.find(frame.timestamp);
             if (it != pending_.end()) {
-                frame.latencyMs = (now100ns() - it->second.submitted) / 10000.0;
+                frame.latencyMs = (to100ns(frame.retrieved) - it->second.submitted) / 10000.0;
                 frame.presented = it->second.presented;
+                frame.trace = it->second.trace;
+                frame.matched = true;
                 pending_.erase(it);
             }
             frames.push_back(std::move(frame));

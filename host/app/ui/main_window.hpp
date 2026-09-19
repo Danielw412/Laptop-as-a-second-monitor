@@ -112,6 +112,8 @@ class MainWindow {
     /// A control's label, or the toast while this control is the one showing it.
     std::wstring labelFor(Id id, const wchar_t *label) const;
     void chooseSetting(Id, const D2D1_RECT_F &anchor);
+    /// "Open log folder": the rolling logs, this run's archive, or the folder of all archived runs.
+    void chooseLogFolder(const D2D1_RECT_F &anchor);
     void applyUrlFromEdit();
     void syncUrlEdit();
     void onStateChanged();

@@ -3,6 +3,7 @@
 #include "display_query.hpp"
 #include "logging.hpp"
 #include "pipeline.hpp"
+#include "session_archive.hpp"
 #include <iostream>
 #include <winrt/base.h>
 namespace lm {
@@ -13,7 +14,7 @@ BOOL WINAPI control(DWORD) {
     return TRUE;
 }
 struct Options {
-    std::string display, backend = "auto", mode = "capture-encode", server = kDefaultSignalingUrl, csv;
+    std::string display, backend = "auto", mode = "capture-encode", server = kDefaultSignalingUrl, csv, tag;
     unsigned fps = 60, seconds = 0, bitrateSwitch = 0;
     bool list = false, allowPrimary = false, pattern = false, synthetic = false, flushGpu = false,
          laptopMon = false;
@@ -62,16 +63,22 @@ Options parse(int argc, char **argv) {
             o.seconds = std::stoul(value());
         else if (a == "--allow-primary")
             o.allowPrimary = true;
+        else if (a == "--diagnostic-tag")
+            o.tag = value();
         else
             throw std::runtime_error("Unknown option: " + a);
     }
     if (o.backend != "dxgi" && o.backend != "wgc" && o.backend != "auto")
         throw std::runtime_error("Capture must be auto, dxgi or wgc");
     parseMode(o.mode);
+    if (!o.tag.empty() && !validDiagnosticTag(o.tag))
+        throw std::runtime_error("--diagnostic-tag takes 1-48 letters, digits, '.', '_' or '-'");
     return o;
 }
 int run(int argc, char **argv) {
     auto o = parse(argc, argv);
+    // Labels every JSON record this run prints (with its run_id), so controlled runs can be told apart later.
+    setDiagnosticTag(o.tag);
     Log::instance().setConsole(true);
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -172,7 +179,8 @@ int main(int argc, char **argv) {
                      "  --laptopmon | --display \\\\.\\DISPLAYn\n"
                      "  --mode capture|convert|encode|capture-encode|stream --capture auto|dxgi|wgc --fps 60\n"
                      "  --seconds 30 --csv results.csv --pattern --synthetic --allow-primary\n"
-                     "  --test-bitrate-switch 5 (alternate encoder bitrate every 5 s)\n";
+                     "  --test-bitrate-switch 5 (alternate encoder bitrate every 5 s)\n"
+                     "  --diagnostic-tag scrolling (label the JSON records of a controlled run)\n";
         return 1;
     }
 }

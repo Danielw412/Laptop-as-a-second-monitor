@@ -2,6 +2,7 @@
 #include "logging.hpp"
 #include "pattern.hpp"
 #include "resources.hpp"
+#include "session_archive.hpp"
 #include <avrt.h>
 #include <d3d11_1.h>
 #include <fstream>
@@ -17,6 +18,50 @@ std::string fixed(double value, int decimals = 1) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(decimals) << value;
     return out.str();
+}
+std::string fixed(const std::optional<double> &value, int decimals = 1) {
+    return value ? fixed(*value, decimals) : std::string("-");
+}
+double milliseconds(Clock::duration d) {
+    return std::chrono::duration<double, std::milli>(d).count();
+}
+// The frame path on the host's steady clock only, one per pipeline session. A frame's stages are sampled when it
+// comes out of the encoder and when it is handed to the transport, from the FrameTrace that travelled with it, so
+// every stage is measured on the same frames. The compositor's stamps never enter any of these. Heap-allocated:
+// the rings are about 200 KB and the engine thread's stack already carries the historical ones.
+struct HostTiming {
+    LatencyTrack acquireToConvert, acquireToEncodeSubmit, acquireToEncoded, acquireToSend, encodedToSend,
+        outputPickup;
+    SourceActivity source;
+    uint64_t repeats = 0;  // Interval: re-encodes of the last surface (still desktop keep-alive, keyframe answers)
+    uint64_t untraced = 0; // Interval: encoder outputs whose submission could not be identified
+    void endInterval() {
+        for (auto *track : {&acquireToConvert, &acquireToEncodeSubmit, &acquireToEncoded, &acquireToSend,
+                            &encodedToSend, &outputPickup})
+            track->endInterval();
+        repeats = untraced = 0;
+    }
+};
+/// name_mean/_p95/_p99 over the rolling ring and name_max over this interval; null where nothing was measured.
+void describeLatency(nlohmann::json &record, const std::string &name, const LatencyTrack &track) {
+    if (track.rolling.count()) {
+        const auto [p95, p99] = track.rolling.percentiles(.95, .99);
+        record[name + "_mean"] = track.rolling.mean();
+        record[name + "_p95"] = p95;
+        record[name + "_p99"] = p99;
+    } else
+        record[name + "_mean"] = record[name + "_p95"] = record[name + "_p99"] = nullptr;
+    record[name + "_max"] = track.intervalCount ? nlohmann::json(track.intervalMax) : nlohmann::json(nullptr);
+}
+/// What the source was doing in the last second, so a quality line can say whether the desktop was simply still.
+std::string sourceContext(const MetricsSnapshot &s) {
+    std::string text = std::to_string(s.sourceFramesInterval) + " new source frames in the last second";
+    text += s.msSinceSourceFrame ? ", newest " + fixed(*s.msSinceSourceFrame / 1000, 1) + " s ago"
+                                 : ", none yet this pipeline session";
+    text += ", " + std::to_string(s.repeatFramesInterval) + " repeat encodes";
+    if (s.userInputIdleMs)
+        text += ", user input " + fixed(*s.userInputIdleMs / 1000, 1) + " s ago";
+    return text;
 }
 class PollTimer {
     HANDLE timer_ =
@@ -88,6 +133,11 @@ class QualityWatch {
     uint64_t corrupted_ = 0, freezes_ = 0, keyframeRequests_ = 0;
     uint32_t rebuilds_ = 0, rebuildsAtStart_ = 0;
     uint64_t keyframeRequestsAtStart_ = 0;
+    // Degraded seconds in the episode, and how many of them brought no new source frame. An episode made of still
+    // seconds is the desktop not changing (the receiver counts the pause as freezes, and the encoded rate
+    // collapses to the keep-alive repeats), not the stream failing.
+    unsigned seconds_ = 0, stillSeconds_ = 0;
+    uint64_t sourceFrames_ = 0; // New source frames across those degraded seconds
     std::string trigger_;
 
   public:
@@ -105,7 +155,8 @@ class QualityWatch {
         else if (s.viewerCorrupted.value_or(0) > 0)
             trigger = fixed(*s.viewerCorrupted, 0) + " frames arrived but never decoded";
         else if (s.viewerFreezes.value_or(0) > 0)
-            trigger = fixed(*s.viewerFreezes, 0) + " freezes at the receiver";
+            trigger = fixed(*s.viewerFreezes, 0) + " freezes at the receiver" +
+                      (s.viewerFreezeMs ? " (" + fixed(*s.viewerFreezeMs, 0) + " ms frozen)" : "");
         if (trigger.empty() && encodedBitsPerSecond > 0 && !inEpisode_)
             baseline_.add(encodedBitsPerSecond); // Only healthy seconds define what normal looks like
         if (!inEpisode_ && trigger.empty())
@@ -121,14 +172,23 @@ class QualityWatch {
             rebuilds_ = 0;
             rebuildsAtStart_ = encoderRebuilds;
             keyframeRequestsAtStart_ = s.keyframeRequests;
+            seconds_ = 1;
+            stillSeconds_ = s.sourceFramesInterval ? 0 : 1;
+            sourceFrames_ = s.sourceFramesInterval;
             logWarning("Picture quality dropped: " + trigger + " | encoder " +
                        std::to_string(s.bitrate / 1000) + " kbps (target " +
                        std::to_string(s.targetBitrate / 1000) + ") | receiver " +
                        (s.viewerFps ? fixed(*s.viewerFps, 0) : "-") + " fps, loss " +
                        (s.loss ? fixed(*s.loss * 100, 2) + "%" : "-") + ", rtt " +
                        (s.rttMs ? fixed(*s.rttMs, 0) + " ms" : "-") + " | host encode " + fixed(s.encodeFps, 0) +
-                       " fps, queue " + std::to_string(s.queueDepth));
+                       " fps, queue " + std::to_string(s.queueDepth) + " | source: " + sourceContext(s));
             return;
+        }
+        if (!trigger.empty()) {
+            ++seconds_;
+            sourceFrames_ += s.sourceFramesInterval;
+            if (!s.sourceFramesInterval)
+                ++stillSeconds_;
         }
         worstQp_ = std::max(worstQp_, s.viewerQp.value_or(0));
         if (encodedBitsPerSecond > 0)
@@ -160,7 +220,10 @@ class QualityWatch {
                     "encode";
         logInfo("Picture quality recovered after " + fixed(seconds, 0) + " s (started: " + trigger_ +
                 ") | worst quantizer " + (worstQp_ > 0 ? fixed(worstQp_, 0) : "-") + ", lowest encoded rate " +
-                fixed(lowestBitrate_ / 1000000, 2) + " Mbps | " + cause);
+                fixed(lowestBitrate_ / 1000000, 2) + " Mbps | " + cause + " | source: " +
+                fixed(double(sourceFrames_) / std::max(1u, seconds_), 1) + " new frames/s over the " +
+                std::to_string(seconds_) + " degraded seconds, none at all in " + std::to_string(stillSeconds_) +
+                " of them");
     }
 };
 // Puts the engine thread into the multimedia scheduling class (MMCSS) for the lifetime of the loop, so a busy
@@ -339,6 +402,11 @@ void StreamingEngine::loop() {
     uint32_t configuredBitrate = o.bitrate.initial;
     auto lastEncoderChange = Clock::now();
     bool hadDisplay = false, reportedMissing = false;
+    // Every record says which engine and which pipeline build it belongs to, and why that build happened, so a
+    // counter that restarts from zero is explained by the record itself.
+    const uint64_t engineSession = nextEngineSession();
+    std::string buildReason = "start"; // Then encoder_rebuild, recovery (after an error) or display_returned
+    uint64_t sourceSequence = 0;       // Numbers every new source frame this engine takes, in order
     auto lastDisplayReport = Clock::now() - std::chrono::hours(1);
     auto timeUp = [&] { return o.seconds && Clock::now() - start >= std::chrono::seconds(o.seconds); };
     auto transportEvents = [this](const TransportEvent &t) {
@@ -380,6 +448,8 @@ void StreamingEngine::loop() {
                 if (hadDisplay && !reportedMissing)
                     emit(EngineEventType::DisplayLost, match.detail);
                 reportedMissing = true;
+                if (hadDisplay)
+                    buildReason = "display_returned";
                 for (int i = 0; i < 25 && !stop_; ++i) {
                     serviceTransport();
                     pollTimer.wait(20);
@@ -442,6 +512,8 @@ void StreamingEngine::loop() {
             const double encoderMs = sinceBuildStart() - deviceMs - captureMs - converterMs;
             const double buildMs = sinceBuildStart();
             const auto ready = Clock::now();
+            const uint64_t pipelineSession = nextPipelineSession();
+            const std::string pipelineReason = buildReason;
             const std::string backendLabel =
                 o.synthetic || o.mode == PipelineMode::Encode ? "Generated GPU source" : backendName(used);
             logInfo("Pipeline: " + backendLabel + " -> GPU NV12 -> " + (encoder ? encoder->name() : "benchmark") +
@@ -451,7 +523,9 @@ void StreamingEngine::loop() {
             // which is why a bitrate change that recreates it is expensive rather than free.
             logInfo("Pipeline built in " + fixed(buildMs) + " ms (device " + fixed(deviceMs) + ", capture " +
                     fixed(captureMs) + ", NV12 converter " + fixed(converterMs) + ", encoder " + fixed(encoderMs) +
-                    ") at " + std::to_string(configuredBitrate) + " bps");
+                    ") at " + std::to_string(configuredBitrate) + " bps | pipeline session " +
+                    std::to_string(pipelineSession) + " (" + pipelineReason + "), engine session " +
+                    std::to_string(engineSession));
             if (encoderRebuildStart) {
                 // The gap the receiver actually saw: from deciding to rebuild until the new pipeline is standing.
                 const double gap =
@@ -488,6 +562,7 @@ void StreamingEngine::loop() {
                 sendTimes, submitIntervals;
             Samples<256> keyframeSizes, deltaSizes, keyframeEncodeTimes, topologyCheckTimes;
             LoopAccounting loop, previousLoop;
+            auto timing = std::make_unique<HostTiming>();
             std::optional<double> firstEncodedMs, firstSentMs;
             uint64_t iterations = 0, previousIterations = 0, keyframes = 0;
             double loopMaxMs = 0, sendMaxMs = 0, frameBytesMax = 0, topologyCheckMaxMs = 0;
@@ -537,7 +612,8 @@ void StreamingEngine::loop() {
                 const double seconds = std::chrono::duration<double>(Clock::now() - ready).count();
                 if (seconds < 1 || !captured)
                     return;
-                logInfo("Pipeline session ended after " + fixed(seconds, 0) + " s: captured " +
+                logInfo("Pipeline session ended after " + fixed(seconds, 0) + " s (pipeline session " +
+                        std::to_string(pipelineSession) + "): captured " +
                         std::to_string(captured) + " (" + fixed(captured / seconds) + "/s), encoded " +
                         std::to_string(encoded) + " (" + fixed(encoded / seconds) + "/s), dropped " +
                         std::to_string(dropped) + ", paced " + std::to_string(paced) + ", keyframes " +
@@ -553,6 +629,8 @@ void StreamingEngine::loop() {
                 // housekeeping deadline. Nothing here spins on a timer while connected.
                 const bool active = !transport_ || transport_->connected();
                 const bool busy = encoder && (encoder->pending() || carried);
+                if (!active)
+                    timing->source.pause();
                 std::optional<Frame> frame;
                 bool fresh = false;
                 Wake wake = Wake::Timeout;
@@ -668,6 +746,7 @@ void StreamingEngine::loop() {
                                     (s.jitterMs ? fixed(*s.jitterMs) + " ms" : "-") + ", estimate " +
                                     (s.receiverEstimateBps ? std::to_string(*s.receiverEstimateBps) + " bps" : "-"));
                             encoderRebuildStart = Clock::now();
+                            buildReason = "encoder_rebuild";
                             break;
                         }
                     }
@@ -706,13 +785,33 @@ void StreamingEngine::loop() {
                             deltaSizes.add(double(f.bytes.size()));
                         if (!firstEncodedMs)
                             firstEncodedMs = std::chrono::duration<double, std::milli>(Clock::now() - ready).count();
+                        // Host-clock stages of this very frame. Repeats of the last surface carry no trace (they
+                        // are not new source frames), and an output the encoder could not match is counted, not
+                        // guessed at.
+                        if (!f.matched)
+                            ++timing->untraced;
+                        if (f.outputSignalled)
+                            timing->outputPickup.add(milliseconds(f.retrieved - *f.outputSignalled));
+                        if (f.trace.sequence) {
+                            if (f.trace.convertStarted)
+                                timing->acquireToConvert.add(
+                                    milliseconds(*f.trace.convertStarted - f.trace.acquired));
+                            timing->acquireToEncodeSubmit.add(
+                                milliseconds(f.trace.encodeSubmitted - f.trace.acquired));
+                            timing->acquireToEncoded.add(milliseconds(f.retrieved - f.trace.acquired));
+                        }
                         if (transport_) {
                             const auto sendStart = Clock::now();
                             const bool sent = transport_->send(f);
-                            const auto sendMs =
-                                std::chrono::duration<double, std::milli>(Clock::now() - sendStart).count();
+                            const auto sendEnd = Clock::now();
+                            const auto sendMs = milliseconds(sendEnd - sendStart);
                             sendTimes.add(sendMs);
                             sendMaxMs = std::max(sendMaxMs, sendMs);
+                            if (sent) {
+                                timing->encodedToSend.add(milliseconds(sendEnd - f.retrieved));
+                                if (f.trace.sequence)
+                                    timing->acquireToSend.add(milliseconds(sendEnd - f.trace.acquired));
+                            }
                             if (sent && !firstSentMs)
                                 firstSentMs =
                                     std::chrono::duration<double, std::milli>(Clock::now() - ready).count();
@@ -725,6 +824,8 @@ void StreamingEngine::loop() {
                 if (frame) {
                     fresh = true;
                     ++captured;
+                    frame->sequence = ++sourceSequence;
+                    timing->source.frame(from100ns(frame->timestamp));
                     if (frame->accumulated > 1) {
                         dropped += frame->accumulated - 1;
                         droppedCoalesced += frame->accumulated - 1;
@@ -758,8 +859,10 @@ void StreamingEngine::loop() {
                 } else if (carried) {
                     frame = carried;
                     carried.reset();
-                } else if (capture && active)
+                } else if (capture && active) {
                     ++noChange;
+                    timing->source.noChange();
+                }
                 if (frame) {
                     // Timestamps come from the compositor when it provides them: evenly spaced RTP timestamps
                     // instead of ones that carry this thread's scheduling jitter.
@@ -808,7 +911,12 @@ void StreamingEngine::loop() {
                             haveSurface = true;
                             if (encoder) {
                                 const int64_t sampleTime = std::max(stamp - epoch, lastSampleTime + 1);
-                                if (!encoder->submit(nv12, sampleTime, frame->presented)) {
+                                FrameTrace trace;
+                                trace.sequence = frame->sequence;
+                                trace.acquired = from100ns(frame->timestamp);
+                                if (o.mode != PipelineMode::Encode)
+                                    trace.convertStarted = t;
+                                if (!encoder->submit(nv12, sampleTime, frame->presented, trace)) {
                                     ++dropped;
                                     ++droppedSubmitFailed;
                                 } else {
@@ -837,12 +945,24 @@ void StreamingEngine::loop() {
                             lastSampleTime = sampleTime;
                             lastInput = now;
                             repeatRequested = false;
+                            ++timing->repeats;
                         }
                     }
                 }
                 if (now - report >= std::chrono::seconds(1)) {
                     const auto interval = std::chrono::duration<double>(now - report).count();
                     auto elapsed = std::chrono::duration<double>(now - start).count();
+                    const auto source = timing->source.take(now);
+                    // Evidence independent of capture: when anyone last touched keyboard or mouse (session-wide),
+                    // and whether the pointer is on the captured display, where moving it must produce frames.
+                    std::optional<double> inputIdleMs;
+                    LASTINPUTINFO input{sizeof input};
+                    if (GetLastInputInfo(&input))
+                        inputIdleMs = double(DWORD(GetTickCount() - input.dwTime));
+                    std::optional<bool> cursorOnDisplay;
+                    POINT cursor{};
+                    if (GetCursorPos(&cursor))
+                        cursorOnDisplay = PtInRect(&selected.rect, cursor) != FALSE;
                     MetricsSnapshot s;
                     s.captureFps = (captured - previousCaptured) / interval;
                     s.encodeFps = (encoded - previousEncoded) / interval;
@@ -850,6 +970,12 @@ void StreamingEngine::loop() {
                     s.encoded = encoded;
                     s.dropped = dropped;
                     s.noChange = noChange;
+                    s.sourceFramesInterval = source.frames;
+                    s.noChangeInterval = source.noChange;
+                    s.repeatFramesInterval = timing->repeats;
+                    s.sourceGapMsMax = source.gapMax;
+                    s.msSinceSourceFrame = source.sinceLastMs;
+                    s.userInputIdleMs = inputIdleMs;
                     s.captureMsMean = capTimes.mean();
                     s.captureMsP95 = capTimes.percentile(.95);
                     s.convertSubmitMsMean = conversionTimes.mean();
@@ -1004,6 +1130,36 @@ void StreamingEngine::loop() {
                                             {"receiver_pli", optionalNumber(s.viewerPli)},
                                             {"encoded_bits_per_second", s.encodeFps * s.frameBytesMean * 8}};
                     describe(stats, usage);
+                    // Which run, engine and pipeline build this record belongs to. A cumulative counter restarts
+                    // exactly when pipeline_session changes; pipeline_build_reason says why it did.
+                    stats["run_id"] = runIdentity().runId;
+                    if (!diagnosticTag().empty())
+                        stats["diagnostic_tag"] = diagnosticTag();
+                    stats["engine_session"] = engineSession;
+                    stats["pipeline_session"] = pipelineSession;
+                    stats["pipeline_session_seconds"] = std::chrono::duration<double>(now - ready).count();
+                    stats["pipeline_build_reason"] = pipelineReason;
+                    // The frame path on the host's steady clock alone, measured on the same traced frames. Kept
+                    // apart from acquire_delay/source_to_encoded, which start from the compositor's stamp.
+                    describeLatency(stats, "host_acquire_to_convert_ms", timing->acquireToConvert);
+                    describeLatency(stats, "host_acquire_to_encode_submit_ms", timing->acquireToEncodeSubmit);
+                    describeLatency(stats, "host_acquire_to_encoded_ms", timing->acquireToEncoded);
+                    describeLatency(stats, "host_acquire_to_send_ms", timing->acquireToSend);
+                    describeLatency(stats, "encoded_to_send_ms", timing->encodedToSend);
+                    describeLatency(stats, "encoder_output_pickup_ms", timing->outputPickup);
+                    stats["untraced_outputs_interval"] = timing->untraced;
+                    // Still desktop or stalled capture: the interval view no_change cannot give on its own.
+                    stats["no_change_interval"] = source.noChange;
+                    stats["repeat_frames_interval"] = timing->repeats;
+                    stats["source_frame_gap_ms_p95"] = optionalNumber(source.gapP95);
+                    stats["source_frame_gap_ms_max"] = optionalNumber(source.gapMax);
+                    stats["ms_since_last_source_frame"] = optionalNumber(source.sinceLastMs);
+                    stats["user_input_idle_ms"] = optionalNumber(inputIdleMs);
+                    stats["cursor_on_display"] =
+                        cursorOnDisplay ? nlohmann::json(*cursorOnDisplay) : nlohmann::json(nullptr);
+                    stats["receiver_frames_received"] = optionalNumber(s.viewerFramesReceived);
+                    stats["receiver_frames_decoded"] = optionalNumber(s.viewerFramesDecoded);
+                    stats["receiver_freeze_ms"] = optionalNumber(s.viewerFreezeMs);
                     if (converter && converter->gpuTimes().count()) {
                         // This asynchronous GPU command span includes driver submission delay.
                         // It is not a pure video-processor execution duration.
@@ -1030,6 +1186,29 @@ void StreamingEngine::loop() {
                             std::to_string(uint64_t(s.frameBytesMean)) + " B, keyframe " +
                             std::to_string(uint64_t(s.keyframeBytesMean)) + " B";
                         logInfo(line);
+                        logInfo("Source: " + std::to_string(source.frames) +
+                                " new frames in the last second, gap p95 " + fixed(source.gapP95, 0) + " ms, max " +
+                                fixed(source.gapMax, 0) + " ms | " +
+                                std::to_string(source.noChange) + " polls with no new frame | newest frame " +
+                                (source.sinceLastMs ? fixed(*source.sinceLastMs / 1000, 1) + " s ago" : "-") +
+                                " | " + std::to_string(timing->repeats) + " repeat encodes | user input " +
+                                (inputIdleMs ? fixed(*inputIdleMs / 1000, 1) + " s ago" : "-") +
+                                (cursorOnDisplay && *cursorOnDisplay ? ", pointer on this display" : ""));
+                        auto mean = [](const LatencyTrack &track) {
+                            return track.rolling.count() ? fixed(track.rolling.mean()) : std::string("-");
+                        };
+                        auto p95 = [](const LatencyTrack &track) {
+                            return track.rolling.count() ? fixed(track.rolling.percentile(.95))
+                                                         : std::string("-");
+                        };
+                        logInfo("Host clock: acquire to convert " + mean(timing->acquireToConvert) +
+                                ", to encoder " + mean(timing->acquireToEncodeSubmit) + ", to encoded " +
+                                mean(timing->acquireToEncoded) + " (p95 " + p95(timing->acquireToEncoded) +
+                                "), to sent " + mean(timing->acquireToSend) + " (p95 " +
+                                p95(timing->acquireToSend) + ") ms | encoder output pickup " +
+                                mean(timing->outputPickup) + " ms (p95 " + p95(timing->outputPickup) + ")");
+                        if (const auto engines = summarizeGpuEngines(usage); !engines.empty())
+                            logInfo("GPU engines, this process / all processes: " + engines);
                         logInfo("Engine thread: " + fixed(s.loopWakeupsPerSecond, 0) + " wake-ups/s (" +
                                 std::to_string(wakes.frame) + " frame, " + std::to_string(wakes.encoder) +
                                 " encoder, " + std::to_string(wakes.transport) + " transport, " +
@@ -1055,7 +1234,8 @@ void StreamingEngine::loop() {
                                     receiver(s.viewerCorrupted, "", 0) + " | freezes " +
                                     receiver(s.viewerFreezes, "", 0) + " | jitter buffer " +
                                     receiver(s.viewerJitterBufferMs, " ms") + " | decode " +
-                                    receiver(s.viewerDecodeMs, " ms") + " | keyframe requests " +
+                                    receiver(s.viewerDecodeMs, " ms") + " | frozen " +
+                                    receiver(s.viewerFreezeMs, " ms", 0) + " | keyframe requests " +
                                     std::to_string(s.keyframeRequests) + " | transport buffer " +
                                     std::to_string(s.bufferBytes / 1024) + " KB | send dropped " +
                                     std::to_string(s.transportDropped));
@@ -1083,6 +1263,7 @@ void StreamingEngine::loop() {
                     loopMaxMs = 0;
                     sendMaxMs = 0;
                     frameBytesMax = 0;
+                    timing->endInterval();
                     report = now;
                     // Topology: a cheap GDI check every second; the full DXGI enumeration (a multi-millisecond
                     // stall on this thread) only every ten seconds, to notice a GPU change as well.
@@ -1118,6 +1299,7 @@ void StreamingEngine::loop() {
             }
         } catch (const std::exception &e) {
             logWarning(e.what());
+            buildReason = "recovery";
             if (!stream)
                 throw;
             emit(EngineEventType::Error, e.what());
@@ -1135,6 +1317,7 @@ void StreamingEngine::loop() {
             // Not a std::exception; treat it like any other pipeline failure and rebuild.
             std::string what = "Windows Runtime error 0x" + std::to_string(uint32_t(e.code()));
             logWarning(what);
+            buildReason = "recovery";
             if (!stream)
                 throw std::runtime_error(what);
             emit(EngineEventType::Error, what);

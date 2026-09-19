@@ -1,9 +1,11 @@
-// Portable tests for pairing, LaptopMon detection, lifecycle state transitions, settings and hashing.
+// Portable tests for pairing, LaptopMon detection, lifecycle state transitions, settings, hashing, logging and the
+// per-run diagnostics archive.
 #include "app_state.hpp"
 #include "display_identity.hpp"
 #include "logging.hpp"
 #include "pairing.hpp"
 #include "settings.hpp"
+#include "session_archive.hpp"
 #include "sha256.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -749,6 +751,202 @@ void testLogging() {
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
+std::vector<std::string> readLines(const std::filesystem::path &path) {
+    std::ifstream file(path);
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(file, line);)
+        lines.push_back(line);
+    return lines;
+}
+// The archive receives exactly what the rolling files receive, keeps numbered segments instead of one replaced
+// backup, and continues its numbering when reopened.
+void testLogArchive() {
+    auto dir = std::filesystem::temp_directory_path() / ("lm-archive-test-" + std::to_string(std::rand()));
+    const auto rolling = dir / "rolling", run = dir / "run";
+    auto &log = Log::instance();
+    log.openFile(rolling, "host.log");
+    log.openRecordFile(rolling, "perf.jsonl");
+    const auto recordsBefore = log.recordsWritten();
+    ArchiveLimits small;
+    small.textSegmentBytes = small.recordSegmentBytes = 4096;
+    small.textSegments = small.recordSegments = 2;
+    log.openArchive(run, small);
+    CHECK(log.archiveDirectory() == run);
+    CHECK(log.recording());
+    log.write(LogLevel::Info, "mirrored line");
+    log.writeRecord(R"({"captured":1})");
+    CHECK(log.recordsWritten() == recordsBefore + 1);
+    // Closing the archive leaves the rolling files going.
+    log.closeArchive();
+    CHECK(log.archiveDirectory().empty());
+    CHECK(log.recording());
+    log.write(LogLevel::Info, "rolling only");
+    log.writeRecord(R"({"captured":2})");
+    auto rollingText = readLines(rolling / "host.log"), archivedText = readLines(run / "host.log");
+    CHECK(rollingText.size() == 2);
+    CHECK(archivedText.size() == 1);
+    CHECK(archivedText.size() == 1 && archivedText[0] == rollingText[0]); // The very same line, stamp included
+    auto rollingRecords = readLines(rolling / "perf.jsonl"), archivedRecords = readLines(run / "perf.jsonl");
+    CHECK(rollingRecords.size() == 2 && archivedRecords.size() == 1);
+    CHECK(archivedRecords.size() == 1 && archivedRecords[0] == rollingRecords[0]);
+    // Archive rotation: each full file becomes the next numbered segment; only the oldest beyond the cap goes.
+    log.closeFile();
+    log.closeRecordFile();
+    log.openArchive(run, small);
+    CHECK(log.recording()); // The archive alone is enough to record
+    const std::string filler(1000, 'x');
+    for (int i = 0; i < 20; ++i)
+        log.writeRecord("{\"pad\":\"" + filler + "\",\"i\":" + std::to_string(i) + "}");
+    log.closeArchive();
+    // ~1 KB records against a 4 KB segment: five segments filled, the first three removed past a cap of two.
+    CHECK(std::filesystem::exists(run / "perf.jsonl"));
+    CHECK(!std::filesystem::exists(run / "perf.001.jsonl"));
+    CHECK(!std::filesystem::exists(run / "perf.1.jsonl")); // Never the rolling scheme's name
+    CHECK(std::filesystem::exists(run / "perf.004.jsonl"));
+    CHECK(std::filesystem::exists(run / "perf.005.jsonl"));
+    // Order survives: the newest segment continues where the one before it ended.
+    auto older = readLines(run / "perf.004.jsonl"), newer = readLines(run / "perf.005.jsonl");
+    CHECK(!older.empty() && !newer.empty());
+    if (!older.empty() && !newer.empty())
+        CHECK(nlohmann::json::parse(older.back())["i"].get<int>() + 1 ==
+              nlohmann::json::parse(newer.front())["i"].get<int>());
+    // Reopened (diagnostics switched off and on): numbering continues after the highest segment.
+    log.openArchive(run, small);
+    for (int i = 0; i < 5; ++i)
+        log.writeRecord("{\"pad\":\"" + filler + "\"}");
+    log.closeArchive();
+    CHECK(std::filesystem::exists(run / "perf.006.jsonl"));
+    CHECK(!std::filesystem::exists(run / "perf.004.jsonl"));
+    CHECK(printable("GPU \x01"
+                    "decoder\n",
+                    64) == "GPU ?decoder?");
+    CHECK(printable(std::string(100, 'a'), 10) == std::string(10, 'a'));
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+// Per-run archive: created and closed with the reason, reopened within the run, earlier runs never deleted, and
+// runs whose process died marked as such.
+void testSessionArchive() {
+    auto root = std::filesystem::temp_directory_path() / ("lm-sessions-test-" + std::to_string(std::rand()));
+    std::filesystem::create_directories(root);
+    auto writeSession = [&](const std::string &id, const std::string &state) {
+        std::filesystem::create_directories(root / id);
+        std::ofstream(root / id / "session.json") << nlohmann::json{{"run_id", id}, {"termination", state}}.dump();
+        std::ofstream(root / id / "host.log") << "a line\n";
+    };
+    writeSession("20200101-000000-11", "running");  // Its process is gone: a crash
+    writeSession("20200101-000000-22", "running");  // Its process is still alive
+    writeSession("20200101-000000-33", "graceful"); // Finished normally
+    std::filesystem::create_directories(root / "not-a-run");
+    std::ofstream(root / "not-a-run" / "session.json") << "{ broken";
+    auto ended = SessionArchive::reconcile(root, [](const nlohmann::json &s) {
+        return s.value("run_id", "") == "20200101-000000-22";
+    });
+    CHECK(ended.size() == 1 && ended[0] == "20200101-000000-11");
+    auto crashed = readSessionFile(root / "20200101-000000-11" / "session.json");
+    CHECK(crashed["termination"] == "abnormal");
+    CHECK(crashed["ended_at"].is_string()); // From the newest file in its folder
+    CHECK(readSessionFile(root / "20200101-000000-22" / "session.json")["termination"] == "running");
+    CHECK(readSessionFile(root / "20200101-000000-33" / "session.json")["termination"] == "graceful");
+    CHECK(readSessionFile(root / "not-a-run" / "session.json").is_discarded());
+    // Reconciling again changes nothing: abnormal is final.
+    CHECK(SessionArchive::reconcile(root, nullptr).size() == 1); // Only the one whose process was "alive" before
+    CHECK(readSessionFile(root / "20200101-000000-22" / "session.json")["termination"] == "abnormal");
+
+    const auto &id = runIdentity();
+    CHECK(!id.runId.empty() && id.runId.ends_with("-" + std::to_string(id.pid)));
+    CHECK(id.startedAtUtc.ends_with("Z"));
+    SessionArchive archive(root);
+    CHECK(!archive.isOpen());
+    const auto folder = archive.open({{"settings", {{"fps", 60}}}});
+    CHECK(archive.isOpen() && folder == root / id.runId);
+    auto session = readSessionFile(folder / "session.json");
+    CHECK(session["run_id"] == id.runId);
+    CHECK(session["termination"] == "running");
+    CHECK(session["ended_at"].is_null());
+    CHECK(session["settings"]["fps"] == 60);
+    CHECK(session["diagnostics_periods"].size() == 1);
+    CHECK(session["version"] == LM_VERSION);
+    // This run is never reconciled away while it is running, whatever the predicate says.
+    SessionArchive::reconcile(root, [](const nlohmann::json &) { return false; });
+    CHECK(readSessionFile(folder / "session.json")["termination"] == "running");
+    archive.append("settings_changes", {{"settings", {{"fps", 30}}}});
+    archive.close(termination::kDiagnosticsOff, {{"perf_records", 3}});
+    CHECK(!archive.isOpen());
+    session = readSessionFile(folder / "session.json");
+    CHECK(session["termination"] == "diagnostics_off");
+    CHECK(session["ended_at"].is_string());
+    CHECK(session["duration_s"].is_number());
+    CHECK(session["perf_records"] == 3);
+    CHECK(session["settings"]["fps"] == 60); // What the run started with
+    CHECK(session["settings_changes"].size() == 1);
+    CHECK(session["diagnostics_periods"][0]["off"].is_string());
+    archive.append("ignored", 1); // Closed: no-op
+    CHECK(!readSessionFile(folder / "session.json").contains("ignored"));
+    // Switched back on: same folder, a second period, running again.
+    CHECK(archive.open({}) == folder);
+    session = readSessionFile(folder / "session.json");
+    CHECK(session["termination"] == "running" && session["ended_at"].is_null());
+    CHECK(session["diagnostics_periods"].size() == 2);
+    archive.close(termination::kGraceful);
+    CHECK(readSessionFile(folder / "session.json")["termination"] == "graceful");
+    archive.close(termination::kFatal); // Already closed: the recorded reason stands
+    CHECK(readSessionFile(folder / "session.json")["termination"] == "graceful");
+    // Earlier runs are all still there, untouched apart from the reconciled state.
+    for (auto *old : {"20200101-000000-11", "20200101-000000-22", "20200101-000000-33"})
+        CHECK(std::filesystem::exists(root / old / "host.log"));
+    auto summary = SessionArchive::summarize(root);
+    CHECK(summary.runs == 5); // Three earlier runs, the malformed folder, and this run
+    CHECK(summary.bytes > 0);
+    // No location: open() refuses rather than writing somewhere relative.
+    SessionArchive nowhere{std::filesystem::path()};
+    bool threw = false;
+    try {
+        nowhere.open({});
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    CHECK(threw);
+#ifdef _WIN32
+    // Liveness is pid plus creation time: this process is alive; the same pid with another start time is not.
+    const nlohmann::json self = {{"pid", id.pid}, {"process_created", id.processCreated}};
+    CHECK(sessionProcessRunning(self));
+    CHECK(!sessionProcessRunning({{"pid", id.pid}, {"process_created", id.processCreated + 1}}));
+    CHECK(!sessionProcessRunning({{"pid", 0xFFFFFFF0u}, {"process_created", 1}}));
+    CHECK(!sessionProcessRunning({{"run_id", "no pid"}}));
+#endif
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+// A run's tag and its pipeline generations.
+void testRunLabels() {
+    CHECK(validDiagnosticTag("scrolling"));
+    CHECK(validDiagnosticTag("benchmark-1"));
+    CHECK(validDiagnosticTag("window_drag.2"));
+    CHECK(!validDiagnosticTag(""));
+    CHECK(!validDiagnosticTag("has space"));
+    CHECK(!validDiagnosticTag("quote\""));
+    CHECK(!validDiagnosticTag(std::string(49, 'a')));
+    CHECK(validDiagnosticTag(std::string(48, 'a')));
+    bool threw = false;
+    try {
+        setDiagnosticTag("no/slashes");
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(diagnosticTag().empty());
+    setDiagnosticTag("video");
+    CHECK(diagnosticTag() == "video");
+    setDiagnosticTag("");
+    CHECK(diagnosticTag().empty());
+    // Generations only move forward and never repeat, whichever engine asks.
+    const auto before = pipelineSessionCount();
+    const auto a = nextPipelineSession(), b = nextPipelineSession();
+    CHECK(a == before + 1 && b == a + 1 && pipelineSessionCount() == b);
+    const auto e = nextEngineSession();
+    CHECK(e == engineSessionCount() && nextEngineSession() == e + 1);
+}
 } // namespace
 int main() {
     testSha256();
@@ -766,6 +964,9 @@ int main() {
     testFailuresAndRecovery();
     testSettings();
     testLogging();
+    testLogArchive();
+    testSessionArchive();
+    testRunLabels();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";
         return 1;

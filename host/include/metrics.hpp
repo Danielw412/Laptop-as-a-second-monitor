@@ -15,6 +15,9 @@ struct MetricsSnapshot {
     // Pipeline
     double captureFps = 0, encodeFps = 0;
     uint64_t captured = 0, encoded = 0, dropped = 0, noChange = 0;
+    // Source activity over the last interval, on the host clock: tells a still desktop from stalled capture.
+    uint64_t sourceFramesInterval = 0, noChangeInterval = 0, repeatFramesInterval = 0;
+    std::optional<double> sourceGapMsMax, msSinceSourceFrame, userInputIdleMs;
     double captureMsMean = 0, captureMsP95 = 0;
     double convertSubmitMsMean = 0, gpuSpanMsMean = 0;
     std::optional<double> encodeMsMean, encodeMsP95, encodeMsP99, pipelineMsMean, pipelineMsP95;
@@ -65,6 +68,8 @@ struct MetricsSnapshot {
     std::optional<double> viewerQp, viewerCorrupted, viewerFreezes, viewerPli, viewerNack;
     std::optional<uint32_t> receiverEstimateBps; // Browser's bandwidth estimate (REMB), for diagnostics
     std::optional<uint64_t> viewerDropped, viewerDecoded;
+    // Frames received and decoded over the receiver's interval, and how long its picture was frozen or paused.
+    std::optional<double> viewerFramesReceived, viewerFramesDecoded, viewerFreezeMs, viewerPauseMs;
     PairingSnapshot pairing;
     std::chrono::steady_clock::time_point updated{};
 };

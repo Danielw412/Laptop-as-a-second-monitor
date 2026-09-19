@@ -35,8 +35,9 @@ host/include, host/src    The engine and the logic it is built from (see "Host" 
 host/app                  The Win32 desktop application (see "App" below)
 host/helper               LaptopMonitorDisplay.exe: the only elevated process
 host/bench                laptop-monitor-bench.exe: same pipeline, command line, CSV/JSON output
-host/tests                core_tests.cpp (bitrate, samples, H.264 framing), logic_tests.cpp (pairing, display
-                          identity, reducer lifecycle, settings, SHA-256)
+host/tests                core_tests.cpp (bitrate, samples, latency/source-activity tracking, H.264 framing),
+                          logic_tests.cpp (pairing, display identity, reducer lifecycle, settings, SHA-256, logging,
+                          the per-run diagnostics archive)
 driver/                   IddCx driver derived from Microsoft's sample; see driver/README.md
 shared/protocol.ts        Signaling message schema and validators shared by worker and viewer
 shared/ice.json           STUN servers and the WebRTC connection timeout, shared by host (via CMake) and viewer
@@ -153,9 +154,11 @@ Host:
   visible hitch. The known, unfixed pathology is an oscillation between roughly 1.5 and 3.5 Mbps every few
   seconds on lossy links (`docs/logging-reference.md`, "Known pathology"). Diagnose from `perf.jsonl` first.
 - Settings are few on purpose (`host/include/settings.hpp`). Internal tuning stays in code.
-- Logs go to `%TEMP%\LaptopMonitor\` (`host.log`, `perf.jsonl`, `setup.log`); settings and the credential to
-  `%LOCALAPPDATA%\LaptopMonitor\`. Every field written to `perf.jsonl` must be described in
-  `docs/logging-reference.md`.
+- Current logs go to `%TEMP%\LaptopMonitor\` (`host.log`, `perf.jsonl`, `setup.log`); each run with diagnostics on
+  is also archived in `%LOCALAPPDATA%\LaptopMonitor\logs\sessions\<run_id>\` (same lines plus `session.json`),
+  which only uninstall or a person deletes. Settings and the credential live in `%LOCALAPPDATA%\LaptopMonitor\`.
+  Every field written to `perf.jsonl` must be described in `docs/logging-reference.md`, and instrumentation stays
+  reporting only: nothing may act on a diagnostic field without saying so.
 - The window is custom drawn (Direct2D); controls are re-laid out every paint in `drawOverview/Details/Settings`
   and hit-tested from that layout. It is 440x664 DIP and does not scroll, so new controls need a place, not just
   an ID. The palette (`renderer.hpp::Theme`) is the product palette: #FFDBBB, #CCBEB1, #997E67, #664930 over
@@ -187,7 +190,7 @@ Viewer:
 | Change capture, conversion or encoding | `host/src/{capture,wgc,converter,encoder}.cpp`; measure with the bench before and after |
 | Change pairing or the signaling protocol | `shared/protocol.ts`, `signaling/src/index.ts`, `host/src/transport.cpp`, `viewer/src/session.ts`, `tests/` (unit + integration), bump `PROTOCOL_VERSION` if incompatible |
 | Change what the receiver shows | `viewer/index.html`, `viewer/src/style.css`, `viewer/src/main.ts` (views), `stage.ts` (stage behaviour), `dashboard.ts` (metrics) |
-| Change what the host logs | `host/src/logging.cpp`, `pipeline.cpp` (per-second record), then `docs/logging-reference.md` |
+| Change what the host logs | `host/src/logging.cpp`, `pipeline.cpp` (per-second record), `session_archive.cpp` (run archive), `host/app/diagnostics.cpp` (when logs open and close), then `docs/logging-reference.md` |
 | Change setup, uninstall or elevation | `host/app/setup.cpp`, `scripts/install-driver.ps1`; both must also clean up the old Browser Monitor names |
 
 ## Gotchas

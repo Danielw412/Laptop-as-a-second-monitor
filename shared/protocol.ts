@@ -140,4 +140,30 @@ export interface Telemetry {
   pli?: number | null;
   nack?: number | null;
   keyFramesDecoded?: number | null;
+  /**
+   * Frame and packet flow over the last interval (the `interval` prefix marks them apart from the cumulative
+   * getStats counters of the same names), FIR requests, and how long the picture was frozen or paused (ms). A pause
+   * is the browser's name for no frame for 5 s or more, which a still desktop produces. `intervalMs` is how long
+   * that interval was; divide by it before comparing counts. Absent on older receivers.
+   */
+  intervalMs?: number | null;
+  intervalFramesReceived?: number | null;
+  intervalFramesDecoded?: number | null;
+  intervalFramesRendered?: number | null;
+  intervalPacketsReceived?: number | null;
+  intervalPacketsLost?: number | null;
+  fir?: number | null;
+  freezeMs?: number | null;
+  pauses?: number | null;
+  pauseMs?: number | null;
+  /** How evenly frames were shown: mean and standard deviation of the gap between them over the interval (ms). */
+  interFrameDelayMs?: number | null;
+  interFrameDelayStdMs?: number | null;
+  /** The jitter buffer's target delay per frame over the interval (ms); near 0 while playout delay 0/0 holds. */
+  jitterBufferTargetMs?: number | null;
+  /** The selected candidate pair's incoming bandwidth estimate (bps), when the browser provides one. */
+  availableIncomingBitrate?: number | null;
+  /** The decoder in use and whether the browser calls it power efficient (hardware); often withheld. */
+  decoder?: string | null;
+  powerEfficientDecoder?: boolean | null;
 }

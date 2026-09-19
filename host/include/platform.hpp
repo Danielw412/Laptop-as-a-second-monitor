@@ -20,9 +20,15 @@
 namespace lm {
 using Microsoft::WRL::ComPtr;
 using Clock = std::chrono::steady_clock;
+inline int64_t to100ns(Clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count() / 100;
+}
 inline int64_t now100ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count() /
-           100;
+    return to100ns(Clock::now());
+}
+/// The inverse of now100ns() for host stamps (Frame::timestamp). Never use it on a compositor stamp.
+inline Clock::time_point from100ns(int64_t ticks) {
+    return Clock::time_point(std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(ticks * 100)));
 }
 /// QueryPerformanceCounter ticks (what DXGI and WGC stamp frames with) in the same 100 ns units as now100ns().
 /// MSVC's steady_clock is QPC-based, so the two are directly comparable.
@@ -69,6 +75,15 @@ struct Frame {
     int64_t timestamp{};  // When the pipeline took the frame (now100ns)
     int64_t presented{};  // When the compositor produced it (100 ns, same clock); 0 if unknown
     uint32_t accumulated = 1;
+    uint64_t sequence = 0; // Assigned by the engine to each new source frame, in acquisition order
+};
+/// One source frame's milestones on the host's steady clock, carried through the encoder so each stage is measured
+/// on the same frame and on one monotonic clock. The compositor's stamps (Frame::presented) never enter it.
+struct FrameTrace {
+    uint64_t sequence = 0;                           // 0: not a source frame (a static-desktop repeat)
+    Clock::time_point acquired{};                    // The capture backend handed the frame to the engine
+    std::optional<Clock::time_point> convertStarted; // The NV12 conversion was issued (absent in encode-only mode)
+    Clock::time_point encodeSubmitted{};             // The encoder accepted the surface (set by the encoder)
 };
 class ICapture {
   public:
@@ -126,6 +141,12 @@ struct Encoded {
     int64_t presented{}; // Source presentation time carried through the encoder (0 if unknown)
     bool keyframe{};
     double latencyMs{};
+    // Host-clock bookkeeping. `matched` is false when the output's sample time did not identify a submission, in
+    // which case latencyMs and trace are empty rather than guessed.
+    bool matched = false;
+    FrameTrace trace;
+    std::optional<Clock::time_point> outputSignalled; // The MFT announced this output (its HaveOutput event)
+    Clock::time_point retrieved{};                    // The engine thread took it from the MFT
 };
 class IEncoder {
   public:
@@ -134,7 +155,9 @@ class IEncoder {
     virtual bool ready() = 0;
     /// True while the encoder still reads this input surface; writing to it would corrupt a frame in flight.
     virtual bool holds(ID3D11Texture2D *) const = 0;
-    virtual bool submit(ID3D11Texture2D *, int64_t timestamp, int64_t presented = 0) = 0;
+    /// trace travels with the frame and comes back on its Encoded output, with encodeSubmitted filled in.
+    virtual bool submit(ID3D11Texture2D *, int64_t timestamp, int64_t presented = 0,
+                        const FrameTrace &trace = {}) = 0;
     virtual std::vector<Encoded> poll() = 0;
     virtual void keyframe() = 0;
     virtual bool bitrate(uint32_t) = 0;

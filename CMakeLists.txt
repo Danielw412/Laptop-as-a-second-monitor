@@ -18,9 +18,10 @@ if(NOT EXISTS "${LM_JSON_INCLUDE}/nlohmann/json.hpp")
   set(LM_JSON_INCLUDE "${nlohmann_json_SOURCE_DIR}/include")
 endif()
 
-# Platform-independent logic: pairing codes, LaptopMon selection, lifecycle reducer, settings, hashing, logging.
+# Platform-independent logic: pairing codes, LaptopMon selection, lifecycle reducer, settings, hashing, logging and
+# the per-run diagnostics archive.
 add_library(lm-logic STATIC host/src/pairing.cpp host/src/display_identity.cpp host/src/app_state.cpp
-            host/src/settings.cpp host/src/logging.cpp)
+            host/src/settings.cpp host/src/logging.cpp host/src/session_archive.cpp)
 target_include_directories(lm-logic PUBLIC host/include "${LM_JSON_INCLUDE}")
 target_compile_definitions(lm-logic PUBLIC "LM_DEFAULT_SIGNALING_URL=\"${LM_DEFAULT_SIGNALING_URL}\""
                            "LM_VIEWER_URL=\"${LM_VIEWER_URL}\"" "LM_VERSION=\"${PROJECT_VERSION}\"")
@@ -78,7 +79,8 @@ if(LM_BUILD_HOST)
 
   # The desktop application.
   add_executable(LaptopMonitor WIN32
-                 host/app/main.cpp host/app/controller.cpp host/app/display_control.cpp host/app/setup.cpp
+                 host/app/main.cpp host/app/controller.cpp host/app/diagnostics.cpp host/app/display_control.cpp
+                 host/app/setup.cpp
                  host/app/ui/main_window.cpp host/app/ui/renderer.cpp host/app/ui/tray.cpp
                  host/app/resources/LaptopMonitor.rc host/app/resources/app.manifest)
   target_include_directories(LaptopMonitor PRIVATE host/app)

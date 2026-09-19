@@ -1,7 +1,9 @@
 #include "controller.hpp"
 #include "app.hpp"
+#include "diagnostics.hpp"
 #include "display_query.hpp"
 #include "logging.hpp"
+#include "session_archive.hpp"
 namespace lm::app {
 namespace {
 constexpr int kFindPollLimit = 60; // 60 polls at 250 ms = 15 s for LaptopMon to appear after device creation
@@ -289,7 +291,15 @@ void AppController::runUninstall(HWND owner) {
     if (engine_)
         engine_->requestStop();
     display_.abandon();
+    // Uninstall deletes %LOCALAPPDATA%\LaptopMonitor, this run's archive included, and a log file held open there
+    // would stop it. The rolling log in Temp keeps recording until the process exits.
+    closeArchive(termination::kUninstall);
     launchElevatedAndWait(owner, L"--uninstall");
+    if (!setupProcess_ && settings_.diagnosticsLog) {
+        // Declined or failed to launch: nothing was deleted, so keep archiving this run.
+        for (auto &[level, line] : startDiagnostics(settings_))
+            Log::instance().write(level, line);
+    }
 }
 void AppController::setupProcessFinished(int exitCode) {
     if (setupProcess_) {
@@ -316,16 +326,18 @@ void AppController::updateSettings(const Settings &updated) {
         setStartAtSignIn(clean.startAtSignIn);
     if (clean.diagnosticsLog != settings_.diagnosticsLog) {
         if (clean.diagnosticsLog) {
-            Log::instance().openFile(logDirectory());
-            Log::instance().openRecordFile(logDirectory());
+            // Turned on mid-run: the archive for this run is created now (or reopened, if it was on before).
+            auto notes = startDiagnostics(clean);
             logInfo("Diagnostics logging turned on: " + Log::instance().path().string() + " and " +
-                    Log::instance().recordPath().string());
+                    Log::instance().recordPath().string() + " | run " + runIdentity().runId);
+            for (auto &[level, line] : notes)
+                Log::instance().write(level, line);
         } else {
             logInfo("Diagnostics logging turned off");
-            Log::instance().closeFile();
-            Log::instance().closeRecordFile();
+            stopDiagnostics(termination::kDiagnosticsOff);
         }
-    }
+    } else if (!(clean == settings_))
+        noteSettings(clean);
     settings_ = clean;
     model_.autoStartDisplay = clean.autoStartDisplay;
     try {

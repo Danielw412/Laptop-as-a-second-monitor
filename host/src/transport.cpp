@@ -115,6 +115,8 @@ class Transport final : public ITransport {
     Clock::time_point retry_ = Clock::now(), deadline_ = Clock::now(), lastTelemetry_ = Clock::now();
     unsigned attempts_ = 0;
     uint64_t frames_ = 0, bytes_ = 0, dropped_ = 0;
+    uint64_t demandBytes_ = 0;
+    std::optional<Clock::time_point> demandAt_;
     Clock::time_point peerStart_{};
     std::optional<Clock::time_point> connectedSince_;
     Json timings_ = Json::object();
@@ -131,6 +133,9 @@ class Transport final : public ITransport {
     Clock::time_point keyframeWindow_ = Clock::now();
     uint64_t keyframeWindowRequests_ = 0;
     Json receiver_ = Json::object();
+    // When receiver_ last changed. A receiver that samples slower than once a second leaves the same message in
+    // several per-second records; its age tells a new sample from a repeated one.
+    std::optional<Clock::time_point> receiverAt_;
     mutable std::mutex pairingMutex_;
     PairingSnapshot pairingSnapshot_;
     void emit(TransportEventType type, std::string detail = {}) {
@@ -206,6 +211,7 @@ class Transport final : public ITransport {
     }
     void reset() {
         ++peerEpoch_;
+        demandAt_.reset();
         track_.reset();
         channel_.reset();
         if (peer_)
@@ -461,13 +467,24 @@ class Transport final : public ITransport {
                         Clock::now() - lastTelemetry_ < std::chrono::milliseconds(500))
                         continue;
                     receiver_ = b;
+                    receiverAt_ = Clock::now();
+                    // Sample successful encoded sends on the host clock, not REMB or receiver throughput.
+                    // This controls upward adaptation only. Missing/stale demand must not prevent a cut.
+                    std::optional<double> sentBitsPerSecond;
+                    if (demandAt_) {
+                        const double seconds = std::chrono::duration<double>(*receiverAt_ - *demandAt_).count();
+                        if (seconds >= 0.5 && seconds <= 3.0)
+                            sentBitsPerSecond = double(bytes_ - demandBytes_) * 8 / seconds;
+                    }
+                    demandAt_ = receiverAt_;
+                    demandBytes_ = bytes_;
                     if (!b.contains("loss") || !b["loss"].is_number() || !b.contains("rttMs") ||
                         !b["rttMs"].is_number() || !b.contains("jitterMs") || !b["jitterMs"].is_number())
                         continue;
                     double loss = b.at("loss").get<double>(), rtt = b.at("rttMs").get<double>(),
                            jitter = b.at("jitterMs").get<double>();
                     const auto before = adaptation_.bitrate();
-                    const auto after = adaptation_.update(loss, rtt, jitter);
+                    const auto after = adaptation_.update(loss, rtt, jitter, sentBitsPerSecond);
                     if (after < before) {
                         ++bitrateDown_;
                         // A cut is the interesting direction: it is what the viewer sees as a softer picture, and
@@ -607,6 +624,10 @@ class Transport final : public ITransport {
                 {"smoothed_loss", adaptation_.smoothedLoss()},
                 {"smoothed_rtt_ms", adaptation_.smoothedRtt()},
                 {"route", describeRoute()},
+                {"receiver_age_ms", receiverAt_ ? Json(std::chrono::duration<double, std::milli>(
+                                                           Clock::now() - *receiverAt_)
+                                                           .count())
+                                                : Json(nullptr)},
                 {"signaling_url", url_},
                 {"receiver", receiver_}};
     }
@@ -693,6 +714,11 @@ class Transport final : public ITransport {
         m.viewerFreezes = number("freezes");
         m.viewerPli = number("pli");
         m.viewerNack = number("nack");
+        // Optional since the receiver added them; an older receiver simply leaves them unset.
+        m.viewerFramesReceived = number("intervalFramesReceived");
+        m.viewerFramesDecoded = number("intervalFramesDecoded");
+        m.viewerFreezeMs = number("freezeMs");
+        m.viewerPauseMs = number("pauseMs");
         if (auto v = number("dropped"))
             m.viewerDropped = uint64_t(std::max(0.0, *v));
         if (auto v = number("decoded"))

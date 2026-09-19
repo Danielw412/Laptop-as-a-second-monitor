@@ -80,10 +80,90 @@ export function intervalDelays(current: DelayCounters, previous?: DelayCounters)
     freezes: current.freezes === undefined || previous.freezes === undefined ? null : Math.max(0, current.freezes - previous.freezes),
   };
 }
+/** Cumulative inbound-rtp counters that only mean something as a change over the interval. Durations in seconds. */
+export type ActivityCounters = {
+  time: number;
+  framesReceived?: number;
+  framesDecoded?: number;
+  framesRendered?: number;
+  packetsReceived?: number;
+  packetsLost?: number;
+  firCount?: number;
+  freezesDuration?: number;
+  pauseCount?: number;
+  pausesDuration?: number;
+  interFrameDelay?: number;
+  squaredInterFrameDelay?: number;
+  jitterBufferTargetDelay?: number;
+  jitterBufferEmitted?: number;
+};
+export type Activity = {
+  /** How long the interval behind these counts was: the browser may sample slower than the page asks. */
+  intervalMs: number | null;
+  intervalFramesReceived: number | null;
+  intervalFramesDecoded: number | null;
+  intervalFramesRendered: number | null;
+  intervalPacketsReceived: number | null;
+  intervalPacketsLost: number | null;
+  fir: number | null;
+  freezeMs: number | null;
+  pauses: number | null;
+  pauseMs: number | null;
+  interFrameDelayMs: number | null;
+  interFrameDelayStdMs: number | null;
+  jitterBufferTargetMs: number | null;
+};
+const NO_ACTIVITY: Activity = {
+  intervalMs: null, intervalFramesReceived: null, intervalFramesDecoded: null, intervalFramesRendered: null,
+  intervalPacketsReceived: null, intervalPacketsLost: null, fir: null, freezeMs: null, pauses: null, pauseMs: null,
+  interFrameDelayMs: null, interFrameDelayStdMs: null, jitterBufferTargetMs: null,
+};
+/**
+ * Frame and packet flow at the receiver over the interval, how long the picture was frozen or paused, and how evenly
+ * frames were shown. A browser that does not publish a counter gets null, never zero; a counter that went down
+ * belongs to a new stream, so that interval is unknown (null) rather than zero or negative.
+ */
+export function intervalActivity(current: ActivityCounters, previous?: ActivityCounters): Activity {
+  if (!previous || current.time <= previous.time) return { ...NO_ACTIVITY };
+  const delta = (a: number | undefined, b: number | undefined) =>
+    a === undefined || b === undefined || a < b ? null : a - b;
+  const ms = (seconds: number | null) => (seconds === null ? null : seconds * 1000);
+  const decoded = delta(current.framesDecoded, previous.framesDecoded);
+  const packets = delta(current.packetsReceived, previous.packetsReceived);
+  // packetsLost is expected minus received, so duplicates can lower it: a fall is no loss, not a reset.
+  const lost =
+    current.packetsLost === undefined || previous.packetsLost === undefined || packets === null
+      ? null
+      : Math.max(0, current.packetsLost - previous.packetsLost);
+  // Inter-frame delay mean and spread from the running sums, per the spec's variance formula.
+  const sum = delta(current.interFrameDelay, previous.interFrameDelay);
+  const squares = delta(current.squaredInterFrameDelay, previous.squaredInterFrameDelay);
+  const mean = sum !== null && decoded ? sum / decoded : null;
+  const spread =
+    mean !== null && squares !== null && decoded ? Math.sqrt(Math.max(0, squares / decoded - mean * mean)) : null;
+  const target = delta(current.jitterBufferTargetDelay, previous.jitterBufferTargetDelay);
+  const emitted = delta(current.jitterBufferEmitted, previous.jitterBufferEmitted);
+  return {
+    intervalMs: current.time - previous.time,
+    intervalFramesReceived: delta(current.framesReceived, previous.framesReceived),
+    intervalFramesDecoded: decoded,
+    intervalFramesRendered: delta(current.framesRendered, previous.framesRendered),
+    intervalPacketsReceived: packets,
+    intervalPacketsLost: lost,
+    fir: delta(current.firCount, previous.firCount),
+    freezeMs: ms(delta(current.freezesDuration, previous.freezesDuration)),
+    pauses: delta(current.pauseCount, previous.pauseCount),
+    pauseMs: ms(delta(current.pausesDuration, previous.pausesDuration)),
+    interFrameDelayMs: ms(mean),
+    interFrameDelayStdMs: ms(spread),
+    jitterBufferTargetMs: target !== null && emitted ? (target * 1000) / emitted : null,
+  };
+}
 export class ReceiverStats {
   private previous?: Previous;
   private previousDelays?: DelayCounters;
   private previousQuality?: QualityCounters;
+  private previousActivity?: ActivityCounters;
   async sample(
     pc: RTCPeerConnection,
   ): Promise<
@@ -142,6 +222,24 @@ export class ReceiverStats {
     };
     const picture = intervalQuality(quality, this.previousQuality);
     this.previousQuality = quality;
+    const counts: ActivityCounters = {
+      time: v.timestamp,
+      framesReceived: v.framesReceived,
+      framesDecoded: v.framesDecoded,
+      framesRendered: v.framesRendered,
+      packetsReceived: v.packetsReceived,
+      packetsLost: v.packetsLost,
+      firCount: v.firCount,
+      freezesDuration: v.totalFreezesDuration,
+      pauseCount: v.pauseCount,
+      pausesDuration: v.totalPausesDuration,
+      interFrameDelay: v.totalInterFrameDelay,
+      squaredInterFrameDelay: v.totalSquaredInterFrameDelay,
+      jitterBufferTargetDelay: v.jitterBufferTargetDelay,
+      jitterBufferEmitted: v.jitterBufferEmittedCount,
+    };
+    const activity = intervalActivity(counts, this.previousActivity);
+    this.previousActivity = counts;
     const telemetry: Telemetry = {
       type: "telemetry",
       loss: delta && v.packetsReceived !== undefined && v.packetsLost !== undefined ? delta.loss : null,
@@ -156,6 +254,14 @@ export class ReceiverStats {
       processingMs: delays?.processingMs ?? null,
       freezes: delays?.freezes ?? null,
       ...picture,
+      ...activity,
+      // Only when the selected candidate pair actually carries an estimate; many browsers publish it for the
+      // sending side alone.
+      availableIncomingBitrate:
+        typeof pair?.availableIncomingBitrate === "number" ? pair.availableIncomingBitrate : null,
+      // Which decoder ran (hardware or software) is often gated by the browser for privacy; null when withheld.
+      decoder: typeof v.decoderImplementation === "string" ? v.decoderImplementation.slice(0, 64) : null,
+      powerEfficientDecoder: typeof v.powerEfficientDecoder === "boolean" ? v.powerEfficientDecoder : null,
     };
     return {
       telemetry,

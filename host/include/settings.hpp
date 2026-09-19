@@ -51,7 +51,8 @@ class SettingsStore {
 std::filesystem::path appDataDirectory(); // %LOCALAPPDATA%\LaptopMonitor
 std::filesystem::path settingsPath();
 std::filesystem::path credentialPath();
-std::filesystem::path logDirectory();
+std::filesystem::path logDirectory();     // %TEMP%\LaptopMonitor: the rolling host.log and perf.jsonl
+std::filesystem::path sessionsDirectory(); // %LOCALAPPDATA%\LaptopMonitor\logs\sessions: one folder per run
 /// Loads the DPAPI-protected host credential or creates a fresh random one. 64 lowercase hex characters.
 std::string loadOrCreateHostSecret(const std::filesystem::path &);
 #endif

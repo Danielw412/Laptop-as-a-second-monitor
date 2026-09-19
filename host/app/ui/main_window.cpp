@@ -1,6 +1,8 @@
 #include "ui/main_window.hpp"
 #include "app.hpp"
+#include "diagnostics.hpp"
 #include "logging.hpp"
+#include "session_archive.hpp"
 #include "resources/resource.h"
 #include <commctrl.h>
 #include <iomanip>
@@ -340,8 +342,15 @@ LRESULT MainWindow::handle(UINT message, WPARAM w, LPARAM l) {
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
-        if (w)
+        if (w) {
+            // Windows may end the process before the orderly exit below finishes; say so in the archive now, so
+            // a sign-out or shutdown is not later mistaken for a crash.
+            closeArchive(termination::kWindowsSessionEnd,
+                         {{"windows_end_session", (l & ENDSESSION_LOGOFF)     ? "sign-out"
+                                                  : (l & ENDSESSION_CLOSEAPP) ? "application close request"
+                                                                              : "shutdown or restart"}});
             controller_->exitApp();
+        }
         return 0;
     case WM_DESTROY:
         destroying_ = true;
@@ -551,7 +560,11 @@ void MainWindow::copyDiagnostics() {
             std::to_string(s.gpuMemoryMb) + " MB | handles " + std::to_string(s.handles) + " | " +
             (s.onBattery ? "on battery" : "on AC") + (s.batterySaver ? ", battery saver on" : "") + "\n";
     text += "Signaling " + s.signalingState + " | WebRTC " + s.webrtcState + "\n";
+    text += "Run: " + runIdentity().runId +
+            (diagnosticTag().empty() ? "" : " | diagnostic tag " + diagnosticTag()) + "\n";
     text += "Logs: " + Log::instance().path().string() + "\n";
+    if (const auto archive = Log::instance().archiveDirectory(); !archive.empty())
+        text += "This run's archive: " + archive.string() + "\n";
     text += "Recent log (codes and credentials are never logged):\n";
     for (auto &line : controller_->recentLog())
         text += line + "\n";
@@ -574,6 +587,32 @@ void MainWindow::applyUrlFromEdit() {
 void MainWindow::syncUrlEdit() {
     if (urlEdit_)
         SetWindowTextW(urlEdit_, widen(controller_ ? controller_->settings().signalingUrl : kDefaultSignalingUrl).c_str());
+}
+void MainWindow::chooseLogFolder(const D2D1_RECT_F &anchor) {
+    // The rolling files are what a quick look wants; the archive is what survives later runs and Temp cleanup.
+    const auto current = logDirectory(), run = archiveDirectory();
+    std::filesystem::path all;
+    try {
+        all = sessionsDirectory();
+    } catch (...) {
+    }
+    std::error_code ec;
+    const bool haveRun = !run.empty() && std::filesystem::exists(run, ec);
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, L"Current logs (host.log, perf.jsonl)");
+    AppendMenuW(menu, MF_STRING | (haveRun ? 0 : MF_GRAYED), 2, L"This run's archive");
+    AppendMenuW(menu, MF_STRING | (all.empty() ? MF_GRAYED : 0), 3, L"All archived runs");
+    auto px = toPixels(anchor);
+    POINT origin{px.left, px.bottom};
+    ClientToScreen(hwnd_, &origin);
+    const UINT command = UINT(TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, origin.x,
+                                               origin.y, hwnd_, nullptr));
+    DestroyMenu(menu);
+    const auto folder = command == 1 ? current : command == 2 ? run : command == 3 ? all : std::filesystem::path();
+    if (folder.empty())
+        return;
+    std::filesystem::create_directories(folder, ec);
+    ShellExecuteW(hwnd_, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 void MainWindow::chooseSetting(Id id, const D2D1_RECT_F &anchor) {
     auto settings = controller_->settings();
@@ -677,12 +716,9 @@ void MainWindow::activate(Id id) {
                         L"Uninstall Laptop Monitor", MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON2) == IDOK)
             controller_->runUninstall(hwnd_);
         break;
-    case Id::OpenLogs: {
-        std::error_code ec;
-        std::filesystem::create_directories(logDirectory(), ec);
-        ShellExecuteW(hwnd_, L"open", logDirectory().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    case Id::OpenLogs:
+        chooseLogFolder(anchor);
         break;
-    }
     case Id::CopyDiagnostics:
         copyDiagnostics();
         break;
