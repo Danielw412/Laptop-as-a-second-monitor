@@ -14,10 +14,14 @@ BOOL WINAPI control(DWORD) {
     return TRUE;
 }
 struct Options {
-    std::string display, backend = "auto", mode = "capture-encode", server = kDefaultSignalingUrl, csv, tag;
-    unsigned fps = 60, seconds = 0, bitrateSwitch = 0;
+    std::string display, backend = "auto", mode = "capture-encode", server = kDefaultSignalingUrl, csv, tag, record,
+        logDir;
+    unsigned fps = 60, seconds = 0, bitrateSwitch = 0, recordSourceEvery = 0, scrollSpeed = 4;
+    std::optional<uint32_t> bitrate;
     bool list = false, allowPrimary = false, pattern = false, synthetic = false, flushGpu = false,
          laptopMon = false;
+    SyntheticContent content = SyntheticContent::Bar;
+    std::optional<EncoderTuning> tuning;
     TransportTestOptions test;
 };
 Options parse(int argc, char **argv) {
@@ -65,7 +69,36 @@ Options parse(int argc, char **argv) {
             o.allowPrimary = true;
         else if (a == "--diagnostic-tag")
             o.tag = value();
-        else
+        else if (a == "--content")
+            o.content = parseSyntheticContent(value());
+        else if (a == "--scroll-speed")
+            o.scrollSpeed = std::stoul(value());
+        else if (a == "--bitrate")
+            o.bitrate = uint32_t(std::stoul(value()));
+        else if (a == "--record")
+            o.record = value();
+        else if (a == "--log-dir")
+            o.logDir = value();
+        else if (a == "--record-source-every")
+            o.recordSourceEvery = std::stoul(value());
+        else if (a == "--rate-control" || a == "--buffer-ms" || a == "--max-qp" || a == "--min-qp" ||
+                 a == "--peak-percent" || a == "--gop") {
+            if (!o.tuning)
+                o.tuning = EngineConfig{}.encoder;
+            const auto v = value();
+            if (a == "--rate-control")
+                o.tuning->rateControl = parseRateControl(v);
+            else if (a == "--buffer-ms")
+                o.tuning->bufferMs = std::stoul(v);
+            else if (a == "--max-qp")
+                o.tuning->maxQp = std::stoul(v);
+            else if (a == "--min-qp")
+                o.tuning->minQp = std::stoul(v);
+            else if (a == "--peak-percent")
+                o.tuning->peakPercent = std::stoul(v);
+            else
+                o.tuning->gopFrames = std::stoul(v);
+        } else
             throw std::runtime_error("Unknown option: " + a);
     }
     if (o.backend != "dxgi" && o.backend != "wgc" && o.backend != "auto")
@@ -80,6 +113,12 @@ int run(int argc, char **argv) {
     // Labels every JSON record this run prints (with its run_id), so controlled runs can be told apart later.
     setDiagnosticTag(o.tag);
     Log::instance().setConsole(true);
+    if (!o.logDir.empty()) {
+        // The app's diagnostics files, written by the bench: quality probes and the flight recorder only run while
+        // they are open, and receiver marks are saved next to them.
+        Log::instance().openFile(o.logDir);
+        Log::instance().openRecordFile(o.logDir);
+    }
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     SetConsoleCtrlHandler(control, TRUE);
@@ -109,6 +148,14 @@ int run(int argc, char **argv) {
     config.bitrateSwitchSeconds = o.bitrateSwitch;
     config.csvPath = o.csv;
     config.test = o.test;
+    config.syntheticContent = o.content;
+    config.scrollSpeed = o.scrollSpeed;
+    config.recordPath = o.record;
+    config.recordSourceEvery = o.recordSourceEvery;
+    if (o.tuning)
+        config.encoder = *o.tuning;
+    if (o.bitrate) // A fixed bitrate: adaptation has nowhere to go
+        config.bitrate = {*o.bitrate, *o.bitrate, *o.bitrate};
     config.signalingUrl = o.server;
     if (config.mode == PipelineMode::Stream)
         config.hostSecret = loadOrCreateHostSecret(credentialPath());
@@ -180,7 +227,12 @@ int main(int argc, char **argv) {
                      "  --mode capture|convert|encode|capture-encode|stream --capture auto|dxgi|wgc --fps 60\n"
                      "  --seconds 30 --csv results.csv --pattern --synthetic --allow-primary\n"
                      "  --test-bitrate-switch 5 (alternate encoder bitrate every 5 s)\n"
-                     "  --diagnostic-tag scrolling (label the JSON records of a controlled run)\n";
+                     "  --diagnostic-tag scrolling (label the JSON records of a controlled run)\n"
+                     "  --content bar|scroll|desktop (what --synthetic and --pattern draw) --scroll-speed 4\n"
+                     "  --bitrate 8000000 (fixed) --rate-control cbr|vbr|low-delay-vbr|quality --peak-percent 150\n"
+                     "  --buffer-ms 500 --max-qp 40 --min-qp 18 --gop 600\n"
+                     "  --record out.h264 [--record-source-every 30] (encoded stream + index, sampled NV12 source)\n"
+                     "  --log-dir dir (write host.log and perf.jsonl there; enables quality probes and marks)\n";
         return 1;
     }
 }

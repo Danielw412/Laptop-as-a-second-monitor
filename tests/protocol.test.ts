@@ -59,6 +59,26 @@ describe("signaling protocol v2", () => {
     expect(() =>
       parseClient(JSON.stringify({ type: "ice", generation, candidate: "video", mid: "0" })),
     ).toThrow());
+  it("carries the generation a reconnecting peer still has media for, and drops anything else there", () => {
+    expect(
+      parseClient(JSON.stringify({ type: "auth", version: 2, role: "host", secret: "a".repeat(64), live: generation })),
+    ).toEqual({ type: "auth", version: 2, role: "host", secret: "a".repeat(64), live: generation });
+    expect(
+      parseClient(JSON.stringify({ type: "auth", version: 2, role: "viewer", token: "b".repeat(64), live: generation })),
+    ).toEqual({ type: "auth", version: 2, role: "viewer", token: "b".repeat(64), live: generation });
+    expect(
+      parseClient(JSON.stringify({ type: "auth", version: 2, role: "viewer", token: "b".repeat(64), live: "<script>" })),
+    ).toEqual({ type: "auth", version: 2, role: "viewer", token: "b".repeat(64) });
+  });
+  it("parses media state reports and nothing more", () => {
+    expect(parseClient(JSON.stringify({ type: "state", generation, live: true, extra: 1 }))).toEqual({
+      type: "state",
+      generation,
+      live: true,
+    });
+    expect(() => parseClient(JSON.stringify({ type: "state", generation, live: "yes" }))).toThrow();
+    expect(() => parseClient(JSON.stringify({ type: "state", generation: "x", live: true }))).toThrow();
+  });
 });
 describe("pairing codes", () => {
   it("uses the 32-symbol alphabet without I, O, 0 or 1", () => {

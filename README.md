@@ -73,9 +73,11 @@ asks the browser for fullscreen (turn that off under *Advanced* if you prefer a 
 showing, the cursor and the small toolbar disappear after 2.5 seconds without mouse movement and come back on any
 movement. **F** toggles fullscreen, **S** opens the connection and performance panel, **Esc** leaves fullscreen,
 and a click on the picture fills the screen when it is not already full (the browser only allows fullscreen from
-a click or key press, so a reloaded page waits for one). The page holds a screen wake lock while the display is
-connected, so the receiving laptop does not dim or sleep under you. A reload or a short signaling drop reconnects
-by itself with the session token; *Disconnect* in the toolbar returns to the code page, and so does being
+a click or key press, so a reloaded page waits for one). **M** marks a damaged picture: the host saves the last
+seconds of its stream and the next source frame next to its logs, and the page saves the frame it decoded as a PNG
+(see *Logging*). The page holds a screen wake lock while the display is connected, so the receiving laptop does not
+dim or sleep under you. A dropped signaling connection does not interrupt the picture (see *Connection*); a reload
+reconnects by itself with the session token; *Disconnect* in the toolbar returns to the code page, and so does being
 disconnected from the host.
 
 LaptopMon is found by its EDID identity (manufacturer `LMV`, product `0001`, name `LaptopMon`), never by its
@@ -84,7 +86,8 @@ LaptopMon is missing it waits, and if it is set as the primary display it refuse
 
 ### Scaling
 
-The stream is always 1920×1080: nothing is downscaled and no browser zoom is involved. What changes is how large
+The stream is 1920×1080 and no browser zoom is involved. (Only when the network cannot carry it does adaptation
+first halve the frame rate and then, below 2.5 Mbps, send 1280×720; see *Connection*.) What changes is how large
 Windows *draws* on that display, which is what makes it readable on a 13-inch receiver.
 
 - The driver's EDID declares LaptopMon as a **294 × 166 mm (13.3") panel**, so 1920×1080 works out to ~166 DPI and
@@ -163,10 +166,29 @@ or 1). Underneath:
 - A restarted host replaces its stale socket instead of being locked out; the credential proves it is the same
   installation.
 
+### Connection
+
+The signaling WebSocket only introduces the two machines. Once the direct WebRTC connection is up, neither side
+tears it down because a WebSocket closed: the host and the page reconnect their sockets in the background, and a
+worker that supports it (`features: ["resume", "heartbeat"]` in its "authenticated" message) confirms that both
+still hold the same session and lets them keep it — no renegotiation, no gap in the picture. An older worker still
+works; there a WebSocket drop costs a renegotiation (a few seconds) as before. The page sends a heartbeat every
+20 s so an idle socket is not timed out on the way, and the host detects a dead socket after three unanswered pings
+(about 40 s). If the direct connection itself drops, the host waits up to 20 s for ICE to recover (and sends a
+keyframe when it does) before the page negotiates a new one. Both ends log the exact reason for every close: the
+host in `host.log`, the page in events it sends to the host's log.
+
+The encoder's bitrate follows the network, not a fixed number: it is cut only on real congestion (packet loss or a
+round-trip time well above the link's own baseline, both from RTCP), recovers after 10 clean seconds, and climbs
+above the preset's starting bitrate towards its maximum only while the desktop actually needs the bits. When the
+target cannot carry 1080p60 well, the stream drops to 30 fps first (half the frames, twice the bits per frame) and to
+720p only below 2.5 Mbps. On Intel's encoder every change rebuilds it (a 250-400 ms pause), so changes are few.
+
 Signaling stays discovery only: video is direct WebRTC with STUN (no TURN). The default endpoint is
 `https://browser-monitor-signaling.danielruoqiao.workers.dev`; change it in Settings or at build time with
 `-DLM_DEFAULT_SIGNALING_URL=...`. The worker in `signaling/` speaks protocol version 2; deploy it with
-`npm run deploy -w signaling` (or the *Deploy signaling* workflow) before using this version of the app against it.
+`npm run deploy -w signaling` (or the *Deploy signaling* workflow) before using this version of the app against it;
+redeploy it to get session resume and heartbeats.
 
 ## Complete uninstall / cleanup
 
@@ -214,21 +236,24 @@ host/app                  Win32 app: main, controller, diagnostics (log and arch
                           (helper client), setup, ui/ (Direct2D window, renderer, tray)
 host/helper               LaptopMonitorDisplay.exe
 host/bench                laptop-monitor-bench.exe
-host/tests                core-tests (bitrate, samples, latency and source-activity tracking, GPU busy share, H.264
-                          framing), logic-tests (pairing, detection, lifecycle, settings, SHA-256, logging, the
+host/tests                core-tests (adaptation, stream shape, keyframe policy, RTP sample times, H.264 and RTCP
+                          parsing, probe comparison, samples, latency and source-activity tracking, GPU busy share,
+                          H.264 framing), logic-tests (pairing, detection, lifecycle, settings, SHA-256, logging, the
                           per-run archive)
 shared/protocol.ts        signaling message schema shared by worker and receiver
 signaling/, viewer/       Cloudflare Worker and receiver page (viewer/src: main = views, stage = the display,
                           session = signaling + WebRTC, dashboard + telemetry = metrics, preferences = storage)
 docs/                     logging-reference.md: what every logged field means, for performance work
-tests/                    vitest (protocol, telemetry) and the signaling integration test
+tests/                    vitest (protocol, telemetry, preferences, probe) and the signaling integration test
+scripts/analyze-recording.py  decodes a recorded stream with ffmpeg and compares it with the source frames
 ```
 
 - C++: `./scripts/dev-build.ps1 -Configure` then `ctest --test-dir build/host`. Portable tests only:
   `cmake -S . -B build/logic -DLM_BUILD_HOST=OFF && cmake --build build/logic && ctest --test-dir build/logic`.
 - Web: `npm ci`, `npm run typecheck`, `npm test`, then `npm run dev:signaling` in one terminal and
   `npm run test:integration` in another (exercises credential auth, code pairing, tickets, one-viewer limit,
-  rotation overlap, resume, kick, host replacement, throttling against the local worker).
+  rotation overlap, heartbeat, session resume, resume token, kick, host replacement, throttling against the local
+  worker).
 - Receiver against a local worker: `npm run dev:viewer`, open `http://127.0.0.1:5173`, expand *Advanced* and set the
   signaling URL to `http://127.0.0.1:8787` (it is remembered from then on); point the app's Settings → Signaling URL
   at the same address.
@@ -243,6 +268,15 @@ tests/                    vitest (protocol, telemetry) and the signaling integra
   `frame_bytes_max`, `keyframes` and the receiver's `jitterBufferMs`, `decodeMs` and `processingMs`; the JSON
   lines also carry the host-clock latencies, source activity and GPU engine time described in the logging
   reference. `--diagnostic-tag scrolling` labels every JSON line of a controlled run.
+- Controlled quality tests without touching a real display: `--synthetic --content desktop` generates a busy
+  desktop on the GPU (scrolling terminal text, a window switch every 3 s, a 30 fps video-like region; `scroll` and
+  `bar` are the gentler ones, and `--pattern --content desktop` draws the same on a chosen display for capture
+  tests). `--bitrate N` fixes the bitrate; `--rate-control`, `--buffer-ms`, `--max-qp`, `--gop` try encoder
+  settings (the log's `Encoder configuration:` line says which ones the encoder actually took). `--record out.h264
+  --record-source-every 30` writes the exact stream plus sampled NV12 source frames, and
+  `python scripts/analyze-recording.py out.h264 --png-dir frames` reports per-frame QP and PSNR per horizontal band
+  between what was encoded and what a receiver decodes. `--log-dir dir` writes `host.log` and `perf.jsonl` there,
+  which also turns on quality probes and receiver marks in `--mode stream`.
 
 ### How the frame loop is paced
 
@@ -254,8 +288,11 @@ frame is converted into a four-surface NV12 ring and handed to the encoder with 
 three frames may be inside the encoder at once (a keyframe takes 20-30 ms on an integrated GPU and would otherwise
 cost the next two frames), and the thread runs in the MMCSS "Capture" scheduling class. RTP packets carry the
 playout-delay header extension set to zero so the browser renders each frame as soon as it is decoded. The Intel
-encoder accepts but ignores live bitrate changes, so bitrate adaptation still recreates the encoder; the periodic
-keyframe interval is 10 s (keyframes are otherwise produced on demand: viewer join, PLI, transport drop).
+encoder accepts but ignores live bitrate changes, so bitrate adaptation recreates the encoder. Keyframes are forced
+on demand (viewer join, PLI or FIR, ICE recovery, a frame that never reached the network) with requests folded
+together and at most one per 300 ms, plus a refresh every 20 s while streaming. After a frame that never reached the
+network, delta frames are held until the next keyframe, because the receiver would otherwise decode them against a
+picture it never got; RTP timestamps of consecutive frames are always at least one tick apart.
 
 ### Logging
 
@@ -273,9 +310,11 @@ the *diagnostics log* setting and neither ever containing a pairing code or cred
   the thread was awake, keyframe versus delta frame size and encode cost, process CPU split into kernel and user
   time, working set, GPU memory in use, GPU engine busy time per engine class (this process and all processes),
   handles, battery and battery-saver state, encoder rebuild count and cost, the display re-enumeration stall,
-  transport buffer pressure, the selected ICE route, where each frame's time goes on the host's own clock (capture
-  to conversion, encoder, encoded output and send), whether the source was still or stalled, and the receiver's own
-  telemetry. This is the file to read when the question is "where is the CPU, GPU or memory going".
+  each frame's QP as the encoder reported it, the network as RTCP describes it (loss, RTT against the link's
+  baseline, NACK, PLI, FIR) and what adaptation made of it, keyframe requests by reason, the selected ICE route,
+  where each frame's time goes on the host's own clock (capture to conversion, encoder, encoded output and send),
+  whether the source was still or stalled, quality probe results, and the receiver's own telemetry. This is the file
+  to read when the question is "where is the CPU, GPU or memory going".
 
 Those rolling files are small and Temp gets cleaned, so every run with diagnostics on is also archived for good in
 `%LOCALAPPDATA%\LaptopMonitor\logs\sessions\<run_id>\`: the same `host.log` and `perf.jsonl` lines plus a
@@ -292,21 +331,24 @@ Read that before instrumenting anything new.
 
 #### Picture quality episodes
 
-"It went extremely pixelated and glitchy, then fixed itself" is two different faults that look alike, and both are
-over before anyone can look. The receiver reports the decoder's mean quantizer (pixelation itself: roughly 20-30
-normal, over 36 visibly blocky), frames that arrived but never decoded, freezes, PLI and NACK; the host watches
-those together with its own encoded bit rate and writes one line when quality drops and one when it recovers:
+"It went extremely pixelated and glitchy, then fixed itself" has three common causes that look alike: the encoder
+running out of bits (QP 44 and above: flat blocks and stale rectangles wherever the picture changes, on any network),
+packet loss (torn and smeared blocks until a keyframe repairs them), and a receiver that falls behind. The host
+watches its own per-frame QP, RTCP loss and keyframe requests, the receiver's freezes and the quality probes, and
+writes one line when quality drops and one when it recovers, naming the cause:
 
 ```
-[warn ] Picture quality dropped: encoded rate fell to 1.4 Mbps from a usual 7.1 Mbps | encoder 1500 kbps …
-[info ] Picture quality recovered after 14 s (started: …) | worst quantizer 44, lowest encoded rate 1.31 Mbps |
-        encoder was recreated 2 time(s) at a lower bitrate: too few bits for this resolution
+[warn ] Picture quality dropped: encoder quantizer 50 at 1898 kbps (flat blocks where the picture changes) | ...
+[info ] Picture quality recovered after 14 s (started: ...) | too few bits for what changed on screen (encoder QP
+        up to 50) | worst QP 50, lowest encoded rate 1.31 Mbps, 0 encoder rebuilds, 12 degraded seconds
 ```
 
-The closing line names the cause: an encoder recreated at a lower bitrate (too few bits for 1080p, so the
-quantizer climbs and the picture turns to blocks), packet loss (torn and smeared blocks until a keyframe repairs
-them), or a quantizer that rose on its own because the desktop content got harder to encode. Watching only; it
-never changes what the pipeline does.
+**Quality probes** check the picture end to end: every 10 s the host reads back the exact surface it encoded and asks
+the receiver for the same frame after decoding (by RTP timestamp); a coarse luma grid of both is compared, and the
+result says `match`, `quantized` (detail lost: too few bits), `corrupted` (a region shows other content) or
+`unrelated`. The captured frame is compared with the encoder's input the same way, so a fault in capture or
+conversion shows too. Watching only; nothing here changes what the pipeline does. The measurements behind all this,
+and how the 2026-09-22 pixelation and disconnects were traced, are in the logging reference.
 
 ## Troubleshooting
 

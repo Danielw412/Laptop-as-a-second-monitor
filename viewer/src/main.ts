@@ -41,7 +41,13 @@ server.value = savedServer() ?? defaultServer;
 fullscreenPreference.checked = autoFullscreen();
 fullscreenPreference.addEventListener("change", () => rememberAutoFullscreen(fullscreenPreference.checked));
 const dashboard = new Dashboard(el("dashboard-grid"));
-const stage = new Stage(el("stage"), { disconnect: () => stop() });
+const stage = new Stage(el("stage"), {
+  disconnect: () => stop(),
+  mark: (rtp) => {
+    session?.note(`picture marked as damaged (rtp ${rtp ?? "unknown"})`);
+    session?.sendToHost({ type: "mark", rtp });
+  },
+});
 const storageKey = "laptop-monitor-session";
 type Saved = { server: string; room: string; token: string };
 let saved: Saved | undefined;
@@ -131,6 +137,7 @@ function start(credentials: Credentials, stream?: MediaStream) {
         if (session === current) stage.attach(s, () => current.presented());
       },
       diagnostics: (d) => dashboard.update(d),
+      probe: (rtp, cols, rows) => stage.probe(rtp, cols, rows),
       // The page moves to the stage as soon as the code has been accepted, so the fullscreen request still falls
       // inside the gesture that submitted the form. Only viewers have a picture to show; the sender test stays put.
       phase: (p) => {
@@ -240,6 +247,10 @@ el("test-pattern").onclick = () =>
     }
   })();
 window.addEventListener("pagehide", () => stop(false));
+// Things outside the connection that explain a stutter or a drop, recorded in the host's log with the rest.
+document.addEventListener("visibilitychange", () => session?.note(`page ${document.visibilityState}`));
+window.addEventListener("online", () => session?.note("network online"));
+window.addEventListener("offline", () => session?.note("network offline"));
 if (saved) {
   server.value = usableSignalingUrl(saved.server) ?? server.value;
   try { start({ role: "viewer", room: saved.room, token: saved.token }); } catch { say("The previous session could not resume. Enter the current code.", true); }

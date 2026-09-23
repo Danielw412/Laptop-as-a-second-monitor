@@ -35,7 +35,8 @@ host/include, host/src    The engine and the logic it is built from (see "Host" 
 host/app                  The Win32 desktop application (see "App" below)
 host/helper               LaptopMonitorDisplay.exe: the only elevated process
 host/bench                laptop-monitor-bench.exe: same pipeline, command line, CSV/JSON output
-host/tests                core_tests.cpp (bitrate, samples, latency/source-activity tracking, H.264 framing),
+host/tests                core_tests.cpp (adaptation, stream shape, keyframe policy, RTP sample times, H.264 and
+                          RTCP parsing, probe comparison, samples, latency/source-activity tracking, H.264 framing),
                           logic_tests.cpp (pairing, display identity, reducer lifecycle, settings, SHA-256, logging,
                           the per-run diagnostics archive)
 driver/                   IddCx driver derived from Microsoft's sample; see driver/README.md
@@ -43,8 +44,9 @@ shared/protocol.ts        Signaling message schema and validators shared by work
 shared/ice.json           STUN servers and the WebRTC connection timeout, shared by host (via CMake) and viewer
 signaling/src/index.ts    The worker: Code and Room Durable Objects, /pair, /room/<id> WebSocket, /health
 viewer/                   The receiver page: index.html, src/{main,stage,session,dashboard,telemetry,preferences}.ts
-tests/                    vitest unit tests (protocol, telemetry, preferences) and signaling.integration.mjs
+tests/                    vitest unit tests (protocol, telemetry, preferences, probe) and signaling.integration.mjs
 benchmarks/               run.ps1 runs the bench matrix; results/ is git-ignored measurement output
+scripts/analyze-recording.py  decodes a bench recording or a mark dump with ffmpeg and compares it with the source
 docs/logging-reference.md Every logged field, its window and what a bad value points at
 .agents/skills/           Design skills used for frontend work (design-taste-frontend, redesign-existing-projects)
 .github/workflows/        ci.yml (web + Windows build), pages.yml (viewer deploy), signaling.yml (worker deploy)
@@ -78,7 +80,13 @@ published to the worker. The host's identity is a random 256-bit credential (DPA
 the worker verifies statelessly. The viewer POSTs the code to `/pair`, gets a room and a single-use ticket,
 authenticates its WebSocket with the ticket, receives a 12 h resume token, and keeps it in `sessionStorage` so a
 reload reconnects without a code. One viewer per host; the host can kick (revokes the token, issues a new code).
-Protocol version is 2 and lives in `shared/protocol.ts`; the worker rejects other versions.
+Protocol version is 2 and lives in `shared/protocol.ts`; the worker rejects other versions. Additions since are
+announced as `features` in "authenticated" and used only when listed, so new clients still work against an older
+deployed worker: `heartbeat` (the text frame "ping" is answered "pong" by the runtime) and `resume` (a peer whose
+WebSocket reconnects while its media connection is up says so with `live` on auth and `state` messages; when both
+peers still hold the current generation the worker answers `ready` with `resume: true` and nobody renegotiates).
+The signaling socket is only needed to (re)negotiate: neither side tears down a connected peer connection because a
+WebSocket closed.
 
 **Receiver flow.** `viewer/src/main.ts` owns the two views: the pairing page and the stage (`stage.ts`). A
 `Session` (`session.ts`) reports `phase` as `pairing` -> `busy` -> `connected`; the page switches to the stage on
@@ -86,7 +94,10 @@ the first `busy`, which is inside the gesture that submitted the form, so the fu
 Typing the sixth character submits. The stage hides the cursor and toolbar after 2.5 s of stillness, holds a screen
 wake lock, and returns to the pairing page only when the session ends (disconnect, kick, rejected credentials).
 `dashboard.ts` renders receiver, connection and host metrics; `telemetry.ts` turns `getStats()` counters into
-interval values and is what the host receives over the "telemetry" data channel.
+interval values and is what the host receives over the "telemetry" data channel, together with the session's event
+ring (connection states, WebSocket close codes) that the host writes to its log. Over the same channel the host asks
+for quality probes (`probe.ts` reads the decoded frame from the track and returns its luma grid) and the M key on
+the stage sends a mark that makes the host save the last seconds of its stream.
 
 ## Build, run, test
 
@@ -151,8 +162,14 @@ Host:
 - The engine thread is event driven; do not add polling timers or sleeps to the loop. Read the "How the frame loop
   is paced" section of `README.md` before touching `pipeline.cpp`.
 - The Intel encoder ignores live bitrate changes; bitrate changes recreate the encoder (`encoder.cpp`), which is a
-  visible hitch. The known, unfixed pathology is an oscillation between roughly 1.5 and 3.5 Mbps every few
-  seconds on lossy links (`docs/logging-reference.md`, "Known pathology"). Diagnose from `perf.jsonl` first.
+  visible 250-400 ms hitch, so adaptation (`NetworkAdaptation` in `core.hpp`) moves in few, large steps. Its inputs
+  are loss and queueing delay from RTCP only: jitter and REMB swing with keyframe bursts on a clean LAN, and acting
+  on them starved a loss-free stream to 1.9 Mbps, where Quick Sync runs at QP 50 and leaves stale, blocky regions
+  (`docs/logging-reference.md`, "Diagnosed 2026-09-22"). Judge picture quality by `qp_mean` and the quality probes,
+  not by the receiver's `corrupted` counter.
+- Frames handed to the network must form an unbroken H.264 reference chain: after a frame that never reached the
+  packetizer the engine withholds delta frames until the next IDR, and sample times stay at least one RTP tick apart.
+  Keep both when changing the send path.
 - Settings are few on purpose (`host/include/settings.hpp`). Internal tuning stays in code.
 - Current logs go to `%TEMP%\LaptopMonitor\` (`host.log`, `perf.jsonl`, `setup.log`); each run with diagnostics on
   is also archived in `%LOCALAPPDATA%\LaptopMonitor\logs\sessions\<run_id>\` (same lines plus `session.json`),

@@ -24,14 +24,31 @@ struct TransportEvent {
     TransportEventType type;
     std::string detail;
 };
+/// Network evidence gathered since the previous takeNetworkReport(), for bitrate adaptation and the log. Loss and RTT
+/// come from the receiver's RTCP reports when there were any, otherwise from its telemetry message.
+struct NetworkReport {
+    std::optional<double> loss, rttMs, jitterMs;
+    std::optional<uint64_t> packets; // Packets the loss fraction is over
+    uint64_t reports = 0, nackedPackets = 0, pli = 0, fir = 0;
+    const char *source = "none"; // "rtcp", "receiver" or "none"
+};
 class ITransport {
   public:
     virtual ~ITransport() = default;
     virtual void poll() = 0;
     virtual bool connected() const = 0;
     virtual bool send(const Encoded &) = 0;
-    virtual bool consumeKeyframeRequest() = 0;
-    virtual uint32_t targetBitrate() const = 0;
+    /// Keyframe requests since the last call, as a bit mask of KeyframePolicy::Reason.
+    virtual uint32_t consumeKeyframeRequests() = 0;
+    virtual NetworkReport takeNetworkReport() = 0;
+    /// Messages the receiver page sent that the engine acts on: quality probe results and "mark" (the viewer
+    /// flagged a damaged picture). Each is a JSON object with a "type".
+    virtual std::vector<nlohmann::json> takeReceiverMessages() = 0;
+    /// Best effort, over the unreliable telemetry channel; false when it is not open or is backed up.
+    virtual bool sendToReceiver(const nlohmann::json &) = 0;
+    /// The RTP timestamp a frame with this encoder sample time carries on the wire (what the receiver's
+    /// requestVideoFrameCallback reports), or empty without a media connection.
+    virtual std::optional<uint32_t> rtpTimestampOf(int64_t sampleTime) const = 0;
     virtual nlohmann::json stats() const = 0;
     virtual void diagnostics(const nlohmann::json &) = 0;
     virtual SignalingState signaling() const = 0;
@@ -50,5 +67,5 @@ struct TransportTestOptions {
 };
 std::unique_ptr<ITransport> webRtc(std::string server, std::string hostSecret,
                                    std::function<void(const TransportEvent &)> events = {},
-                                   TransportTestOptions test = {}, BitratePlan plan = bitratePlan(QualityPreset::Balanced));
+                                   TransportTestOptions test = {});
 } // namespace lm

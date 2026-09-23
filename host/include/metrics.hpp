@@ -45,6 +45,9 @@ struct MetricsSnapshot {
     std::optional<double> firstEncodedMs, firstSentMs; // From pipeline ready to the first frame out
     double topologyCheckMsMax = 0;     // Longest display re-enumeration stall on the engine thread
     uint32_t bitrate = 0, targetBitrate = 0;
+    // Mean QP of the frames encoded over the interval, as the encoder reported it (pixelation measured at the
+    // source: 44 and above is flat blocks wherever the picture changed).
+    std::optional<double> encoderQp;
     bool dynamicBitrate = true;
     size_t queueDepth = 0;
     std::optional<double> cpuPercent, cpuKernelPercent;

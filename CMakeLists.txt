@@ -58,10 +58,10 @@ if(LM_BUILD_HOST)
   # capture texture -> D3D11 video processor NV12 -> hardware H.264 MFT -> RTP. No CPU readback.
   add_library(lm-pipeline STATIC host/src/capture.cpp host/src/converter.cpp host/src/encoder.cpp
               host/src/transport.cpp host/src/wgc.cpp host/src/pattern.cpp host/src/display_query.cpp
-              host/src/display_scale.cpp host/src/resources.cpp
-              host/src/pipeline.cpp)
+              host/src/display_scale.cpp host/src/resources.cpp host/src/synthetic.cpp
+              host/src/frame_diagnostics.cpp host/src/pipeline.cpp)
   target_include_directories(lm-pipeline PUBLIC host/include "${CMAKE_BINARY_DIR}/generated")
-  target_link_libraries(lm-pipeline PUBLIC lm-logic datachannel-static d3d11 dxgi mfplat mf mfuuid
+  target_link_libraries(lm-pipeline PUBLIC lm-logic datachannel-static d3d11 dxgi d2d1 dwrite mfplat mf mfuuid
                         wmcodecdspuuid ole32 oleaut32 user32 gdi32 shcore shell32 windowsapp evr avrt
                         psapi advapi32)
 

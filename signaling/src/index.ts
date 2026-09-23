@@ -1,6 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   CODE_RE,
+  FEATURES,
+  HEARTBEAT,
+  HEARTBEAT_REPLY,
   MAX_MESSAGE,
   ROOM_RE,
   normalizeCode,
@@ -16,6 +19,8 @@ type Attachment = {
   deadline: number;
   window: number;
   count: number;
+  /** The generation this peer still has a working media connection for, as it last said (auth or "state"). */
+  live?: string;
 };
 type StoredCode = { hash: string; expires: number };
 type Ticket = { hash: string; expires: number };
@@ -52,6 +57,12 @@ export class Code extends DurableObject<Env> {
   }
 }
 export class Room extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    // Heartbeats are answered by the runtime itself: they keep idle connections (a receiver's socket carries
+    // nothing once video flows) from being timed out by proxies, without waking the object or counting as messages.
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(HEARTBEAT, HEARTBEAT_REPLY));
+  }
   async fetch(): Promise<Response> {
     // Bound unauthenticated sockets too; an alarm clears abandoned handshakes.
     if (this.ctx.getWebSockets().length >= 6)
@@ -146,7 +157,16 @@ export class Room extends DurableObject<Env> {
     return !!failures && Date.now() - failures.window <= 60_000 && failures.count > MAX_PAIR_FAILURES;
   }
   private async startGeneration() {
-    if (this.peers("host").length !== 1 || this.peers("viewer").length !== 1) return;
+    const hosts = this.peers("host"), viewers = this.peers("viewer");
+    if (hosts.length !== 1 || viewers.length !== 1) return;
+    // Both peers came back to a generation whose media connection they both still have: a WebSocket dropped, the
+    // video did not. Let them keep it rather than tear down a working connection to negotiate a new one.
+    const current = await this.ctx.storage.get<string>("generation");
+    const live = (w: WebSocket) => (w.deserializeAttachment() as Attachment).live;
+    if (current && live(hosts[0]) === current && live(viewers[0]) === current) {
+      for (const peer of this.peers()) peer.send(JSON.stringify({ type: "ready", generation: current, resume: true }));
+      return;
+    }
     const generation = crypto.randomUUID();
     await this.ctx.storage.put("generation", generation);
     for (const peer of this.peers()) peer.send(JSON.stringify({ type: "ready", generation }));
@@ -215,6 +235,7 @@ export class Room extends DurableObject<Env> {
       }
       a.authenticated = true;
       a.role = m.role;
+      a.live = m.live;
       ws.serializeAttachment(a);
       if (m.role === "viewer") {
         const token = randomHex(32);
@@ -222,8 +243,8 @@ export class Room extends DurableObject<Env> {
           hash: await sha256Hex(token),
           expires: Date.now() + TOKEN_TTL,
         } satisfies ViewerToken);
-        ws.send(JSON.stringify({ type: "authenticated", role: "viewer", token, room: this.room() }));
-      } else ws.send(JSON.stringify({ type: "authenticated", role: "host" }));
+        ws.send(JSON.stringify({ type: "authenticated", role: "viewer", token, room: this.room(), features: FEATURES }));
+      } else ws.send(JSON.stringify({ type: "authenticated", role: "host", features: FEATURES }));
       await this.startGeneration();
       return;
     }
@@ -240,6 +261,14 @@ export class Room extends DurableObject<Env> {
       await this.ctx.storage.put("codes", codes);
       const room = this.room();
       await Promise.all(m.codes.map((c) => this.env.CODES.getByName(c.hash).register(room, c.ttlMs)));
+      return;
+    }
+    if (m.type === "state") {
+      // Only about the current generation; never relayed.
+      if (m.generation === (await this.ctx.storage.get("generation"))) {
+        a.live = m.live ? m.generation : undefined;
+        ws.serializeAttachment(a);
+      }
       return;
     }
     if (m.type === "kick") {
@@ -267,10 +296,15 @@ export class Room extends DurableObject<Env> {
     for (const peer of this.peers(a.role === "host" ? "viewer" : "host"))
       peer.send(JSON.stringify(m));
   }
-  async webSocketClose(ws: WebSocket) {
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    // Visible in `wrangler tail`: which side went and how, to put next to the host's and receiver's own logs.
+    const a = ws.deserializeAttachment() as Attachment;
+    console.log(JSON.stringify({ event: "close", role: a.role ?? "unauthenticated", code, reason, wasClean }));
     await this.depart(ws);
   }
-  async webSocketError(ws: WebSocket) {
+  async webSocketError(ws: WebSocket, error: unknown) {
+    const a = ws.deserializeAttachment() as Attachment;
+    console.log(JSON.stringify({ event: "error", role: a.role ?? "unauthenticated", error: String(error) }));
     ws.close(1011, "connection");
     await this.depart(ws);
   }
@@ -279,7 +313,8 @@ export class Room extends DurableObject<Env> {
     if (!a.authenticated) return;
     a.authenticated = false;
     ws.serializeAttachment(a);
-    await this.ctx.storage.delete("generation");
+    // The generation stays: if both peers come back still holding its media connection, they resume it
+    // (startGeneration). A peer that comes back without one gets a fresh generation there.
     for (const peer of this.peers())
       peer.send(JSON.stringify({ type: "peer-left" }));
   }

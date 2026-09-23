@@ -318,7 +318,10 @@ std::vector<Effect> reduce(AppModel &m, const Event &e) {
             m.detail = "reconnect";
         if (m.signaling != SignalingStatus::Rejected)
             m.signaling = SignalingStatus::Disconnected;
-        m.viewer = ViewerStatus::None;
+        // The WebSocket only introduces the two machines: a receiver whose media connection is up stays connected
+        // while signaling reconnects (the transport keeps it, and resumes the session when the socket is back).
+        if (m.viewer != ViewerStatus::Connected)
+            m.viewer = ViewerStatus::None;
         break;
     case EventType::SignalingRejected:
         m.signaling = SignalingStatus::Rejected;

@@ -7,10 +7,16 @@
  * for a click on the picture, the F key or the toolbar. A screen wake lock keeps the receiving laptop from dimming
  * while it is being used as a monitor.
  */
+import { base64, frameGrid, frameRtp, readFrame, rtpAfter } from "./probe";
 const IDLE_MS = 2500;
+/** A probed frame not decoded this long after the host asked never will be (it was skipped or lost). */
+const PROBE_TIMEOUT_MS = 2000;
 export interface StageActions {
   disconnect(): void;
+  /** The person watching pressed M: the picture looks damaged. `rtp` is the next decoded frame's, when known. */
+  mark?(rtp: number | null): void;
 }
+type ProbeGrid = { rtp: number; cols: number; rows: number; mean: string; detail: string };
 export class Stage {
   private readonly video: HTMLVideoElement;
   private readonly statusEl: HTMLElement;
@@ -29,7 +35,7 @@ export class Stage {
   private everFullscreen = false;
   constructor(
     private readonly root: HTMLElement,
-    actions: StageActions,
+    private readonly actions: StageActions,
   ) {
     const el = <T extends HTMLElement>(id: string) => root.querySelector<T>(`#${id}`)!;
     this.video = el<HTMLVideoElement>("video");
@@ -105,6 +111,57 @@ export class Stage {
     this.video.srcObject = null;
     this.playButton.hidden = true;
   }
+  private track(): MediaStreamTrack | undefined {
+    const stream = this.video.srcObject;
+    return stream instanceof MediaStream ? stream.getVideoTracks()[0] : undefined;
+  }
+  /**
+   * The luma grid of the decoded frame with this RTP timestamp, or undefined when a later frame arrives first, it
+   * never arrives, or this browser cannot read frames (the host counts each of those as a missed probe).
+   */
+  async probe(rtp: number, cols?: number, rows?: number): Promise<ProbeGrid | undefined> {
+    const track = this.track();
+    if (!track) return undefined;
+    const frame = await readFrame(
+      track,
+      (f) => frameRtp(f) === rtp,
+      (f) => {
+        const t = frameRtp(f);
+        return t !== undefined && rtpAfter(t, rtp);
+      },
+      PROBE_TIMEOUT_MS,
+    );
+    if (!frame) return undefined;
+    try {
+      const g = await frameGrid(frame, cols, rows);
+      return g && { rtp, cols: g.cols, rows: g.rows, mean: base64(g.mean), detail: base64(g.detail) };
+    } finally {
+      frame.close();
+    }
+  }
+  /** Tells the host this moment looked wrong and saves the next decoded frame as a PNG (the M key). */
+  private async mark() {
+    const track = this.track();
+    const frame = track ? await readFrame(track, () => true, () => false, 1000) : undefined;
+    const rtp = frame ? frameRtp(frame) ?? null : null;
+    this.actions.mark?.(rtp);
+    if (!frame) return;
+    try {
+      const w = frame.displayWidth, h = frame.displayHeight;
+      if (typeof OffscreenCanvas === "undefined" || !w || !h) return;
+      const canvas = new OffscreenCanvas(w, h);
+      canvas.getContext("2d")?.drawImage(frame, 0, 0, w, h);
+      const blob = await canvas.convertToBlob({ type: "image/png" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      link.download = `laptop-monitor-mark-${stamp}-rtp${rtp ?? "unknown"}.png`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 10_000);
+    } finally {
+      frame.close();
+    }
+  }
   /** Live means a picture is on screen: the overlay goes, and the cursor and toolbar hide when still. */
   setLive(on: boolean) {
     this.live = on;
@@ -161,6 +218,11 @@ export class Stage {
     } else if (e.key === "s" || e.key === "S") {
       e.preventDefault();
       this.toggleStats();
+    } else if ((e.key === "m" || e.key === "M") && this.live) {
+      // Diagnostics: tell the host this moment looked wrong (it saves the last seconds of its stream) and keep a
+      // copy of what was on screen here.
+      e.preventDefault();
+      void this.mark();
     }
   }
   /** Cursor and toolbar come back on any movement, and go again after a moment if a picture is showing. */

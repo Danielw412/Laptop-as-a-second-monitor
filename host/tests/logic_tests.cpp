@@ -288,6 +288,19 @@ void testLifecycleHappyPath() {
     CHECK(m.phase == Phase::Reconnecting);
     step(m, EventType::SignalingConnected);
     CHECK(m.phase == Phase::Ready);
+    // A signaling drop under a live picture: the media connection is kept, so the receiver stays connected through
+    // the reconnect and the resume (which brings no new ViewerJoined), and only a media drop changes that.
+    step(m, EventType::ViewerJoined);
+    step(m, EventType::WebRtcConnected);
+    CHECK(m.phase == Phase::Connected);
+    step(m, EventType::SignalingDisconnected);
+    CHECK(m.viewer == ViewerStatus::Connected && m.phase == Phase::Connected);
+    step(m, EventType::SignalingConnecting);
+    step(m, EventType::SignalingConnected);
+    CHECK(m.phase == Phase::Connected);
+    step(m, EventType::SignalingDisconnected);
+    step(m, EventType::WebRtcDisconnected);
+    CHECK(m.phase == Phase::Reconnecting);
 }
 void testSetupRequired() {
     AppModel m;

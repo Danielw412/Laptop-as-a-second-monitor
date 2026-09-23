@@ -2,8 +2,12 @@ import ice from "../../shared/ice.json";
 import {
   CODE_LIFETIME_MS,
   DIRECT_FAILURE,
+  HEARTBEAT,
+  HEARTBEAT_REPLY,
   sha256Hex,
   type PairResponse,
+  type ProbeReply,
+  type ReceiverEvent,
   type Role,
   type ServerMessage,
 } from "../../shared/protocol";
@@ -27,6 +31,8 @@ export interface SessionHandlers {
   phase?(phase: SessionPhase): void;
   paired?(p: Paired): void;
   ended?(reason: string): void;
+  /** The host asked for the luma grid of the frame with this RTP timestamp (a quality probe). */
+  probe?(rtp: number, cols?: number, rows?: number): Promise<Omit<ProbeReply, "type" | "id"> | undefined>;
 }
 export const ERROR_TEXT: Record<string, string> = {
   "invalid-code": "That code was not recognized or has expired. Check the code shown in Laptop Monitor and try again.",
@@ -46,6 +52,12 @@ const CONNECTION_TEXT: Record<RTCPeerConnectionState, string | undefined> = {
   failed: "Direct connection failed. Retrying…",
   closed: "Connection closed",
 };
+/** A heartbeat every 20 s keeps an idle signaling socket from being timed out by a proxy on the way. */
+const HEARTBEAT_MS = 20_000;
+/** No reply to heartbeats for this long: the socket is dead even if the browser has not noticed. */
+const HEARTBEAT_TIMEOUT_MS = 50_000;
+/** Receiver events kept and repeated in telemetry until the host has certainly seen them. */
+const EVENT_RING = 12;
 export class Session {
   private ws?: WebSocket;
   private pc?: RTCPeerConnection;
@@ -57,6 +69,9 @@ export class Session {
   private retryTimer?: ReturnType<typeof setTimeout>;
   private deadline?: ReturnType<typeof setTimeout>;
   private statsTimer?: ReturnType<typeof setInterval>;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private lastHeard = 0;
+  private features: string[] = [];
   private chain = Promise.resolve();
   private started = performance.now();
   private stages: Record<string, unknown> = {};
@@ -64,6 +79,9 @@ export class Session {
   private room?: string;
   private token?: string;
   private lastPhase?: SessionPhase;
+  private events: ReceiverEvent[] = [];
+  private eventId = 0;
+  private lastCandidateError = "";
   private connectionStats(resetPeer = false) {
     this.on.diagnostics({ type: "connection-stats", ...this.stages,
       state: this.pc?.connectionState ?? "new", ice: this.pc?.iceConnectionState,
@@ -78,6 +96,11 @@ export class Session {
     this.lastPhase = p;
     this.on.phase?.(p);
   }
+  /** Something the host's log should know about; delivered with the next telemetry messages. */
+  note(text: string) {
+    this.events.push({ id: ++this.eventId + Date.now() * 1000, at: new Date().toISOString(), text: text.slice(0, 180) });
+    if (this.events.length > EVENT_RING) this.events.shift();
+  }
   presented() { this.mark("firstVideoMs"); }
   constructor(
     private server: string,
@@ -90,6 +113,10 @@ export class Session {
   }
   get role(): Role {
     return this.credentials.role;
+  }
+  /** A working media connection: kept across signaling reconnects. */
+  private live(): boolean {
+    return this.pc?.connectionState === "connected";
   }
   private signalingUrl(): URL {
     const url = new URL(this.server);
@@ -108,12 +135,14 @@ export class Session {
   start() {
     if (this.stopped) return;
     this.started = performance.now();
-    this.stages = { label: "Connecting" };
-    this.connectionStats(true);
+    if (!this.live()) {
+      this.stages = { label: "Connecting" };
+      this.connectionStats(true);
+    }
     const url = this.signalingUrl();
     // A token outlives the code it was obtained with, so resuming prefers it over the code.
     if (this.room && (this.token || this.credentials.role === "host")) {
-      this.phase("busy");
+      if (!this.live()) this.phase("busy");
       this.open(url, undefined);
     } else if (this.credentials.role === "viewer" && "code" in this.credentials) {
       this.phase("pairing");
@@ -163,38 +192,71 @@ export class Session {
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = `/room/${this.room}`;
     const ws = (this.ws = new WebSocket(url));
-    this.on.status("Connecting to signaling…");
+    const opened = performance.now();
+    this.features = [];
+    if (!this.live()) this.on.status("Connecting to signaling…");
     ws.onopen = () => {
+      // With a media connection still up, say so: a worker that keeps sessions then resumes it.
+      const live = this.live() && this.generation ? { live: this.generation } : {};
       if (this.credentials.role === "host")
-        ws.send(JSON.stringify({ type: "auth", version: 2, role: "host", secret: this.credentials.secret }));
-      else if (ticket) ws.send(JSON.stringify({ type: "auth", version: 2, role: "viewer", ticket }));
-      else ws.send(JSON.stringify({ type: "auth", version: 2, role: "viewer", token: this.token }));
+        ws.send(JSON.stringify({ type: "auth", version: 2, role: "host", secret: this.credentials.secret, ...live }));
+      else if (ticket) ws.send(JSON.stringify({ type: "auth", version: 2, role: "viewer", ticket, ...live }));
+      else ws.send(JSON.stringify({ type: "auth", version: 2, role: "viewer", token: this.token, ...live }));
     };
     ws.onmessage = (e) => {
+      this.lastHeard = performance.now();
+      if (e.data === HEARTBEAT_REPLY) return;
       this.chain = this.chain
         .then(async () => {
           if (this.ws !== ws || this.stopped) return;
           await this.message(JSON.parse(e.data) as ServerMessage);
         })
-        .catch(() =>
-          this.on.error("Negotiation failed. Disconnect and reconnect to retry."),
-        );
+        .catch((error: unknown) => {
+          this.note(`negotiation error: ${error instanceof Error ? error.message : String(error)}`);
+          this.on.error("Negotiation failed. Disconnect and reconnect to retry.");
+        });
     };
-    ws.onerror = () =>
-      this.on.error(
-        "Signaling connection failed. Check the server URL and network.",
-      );
-    ws.onclose = () => {
+    ws.onerror = () => {
+      if (!this.live())
+        this.on.error("Signaling connection failed. Check the server URL and network.");
+    };
+    ws.onclose = (e) => {
       if (this.ws !== ws || this.stopped) return;
-      this.resetPeer();
-      this.phase("busy");
-      this.on.status("Signaling disconnected. Reconnecting…");
+      clearInterval(this.heartbeatTimer);
+      const seconds = ((performance.now() - opened) / 1000).toFixed(1);
+      if (this.live()) {
+        // The WebSocket only introduces the two machines; the video does not need it. Keep the picture and
+        // reconnect in the background.
+        this.note(`signaling closed (code ${e.code}${e.reason ? ` ${e.reason}` : ""}, after ${seconds} s); media kept`);
+      } else {
+        this.note(`signaling closed (code ${e.code}${e.reason ? ` ${e.reason}` : ""}, after ${seconds} s)`);
+        this.resetPeer();
+        this.phase("busy");
+        this.on.status("Signaling disconnected. Reconnecting…");
+      }
       this.scheduleRetry();
     };
+  }
+  /** Heartbeats only where the worker answers them (an older worker would reject the frame). */
+  private startHeartbeat() {
+    clearInterval(this.heartbeatTimer);
+    if (!this.features.includes("heartbeat")) return;
+    this.lastHeard = performance.now();
+    const ws = this.ws;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws !== ws || ws?.readyState !== WebSocket.OPEN) return;
+      if (performance.now() - this.lastHeard > HEARTBEAT_TIMEOUT_MS) {
+        this.note("signaling heartbeat unanswered; reconnecting");
+        ws.close();
+        return;
+      }
+      ws.send(HEARTBEAT);
+    }, HEARTBEAT_MS);
   }
   stop() {
     this.stopped = true;
     clearTimeout(this.retryTimer);
+    clearInterval(this.heartbeatTimer);
     this.resetPeer();
     this.ws?.close();
     this.stream?.getTracks().forEach((t) => t.stop());
@@ -202,6 +264,16 @@ export class Session {
   private send(message: object) {
     if (this.ws?.readyState === WebSocket.OPEN)
       this.ws.send(JSON.stringify({ ...message, generation: this.generation }));
+  }
+  /** Tells a worker that keeps sessions whether this side's media connection for the generation is up. */
+  private sendState(live: boolean) {
+    if (this.features.includes("resume") && this.generation) this.send({ type: "state", live });
+  }
+  /** Sends a message to the host over the telemetry channel, if it is open. */
+  sendToHost(message: object): boolean {
+    if (this.channel?.readyState !== "open" || this.channel.bufferedAmount >= 16384) return false;
+    this.channel.send(JSON.stringify(message));
+    return true;
   }
   private resetPeer() {
     clearTimeout(this.deadline);
@@ -216,16 +288,31 @@ export class Session {
   private data(channel: RTCDataChannel) {
     this.channel = channel;
     channel.onmessage = (e) => {
+      if (typeof e.data !== "string" || e.data.length >= 8192) return;
+      let m: unknown;
       try {
-        if (typeof e.data === "string" && e.data.length < 8192)
-          this.on.diagnostics(JSON.parse(e.data));
+        m = JSON.parse(e.data);
       } catch {
-        /* Ignore non-JSON diagnostics. */
+        return; /* Ignore non-JSON diagnostics. */
       }
+      const request = m as { type?: string; id?: unknown; rtp?: unknown; cols?: unknown; rows?: unknown };
+      if (request.type === "probe-request" && typeof request.id === "number" && typeof request.rtp === "number") {
+        const id = request.id;
+        // The grid size comes from the host, within reason (the reply must stay a modest message).
+        const size = (v: unknown, max: number) =>
+          typeof v === "number" && Number.isInteger(v) && v > 0 && v <= max ? v : undefined;
+        const cols = size(request.cols, 480), rows = size(request.rows, 270);
+        void (this.on.probe?.(request.rtp, cols, rows) ?? Promise.resolve(undefined)).then((grid) =>
+          this.sendToHost({ type: "probe", id, ...(grid ?? { missed: true }) } satisfies ProbeReply),
+        );
+        return;
+      }
+      this.on.diagnostics(m);
     };
   }
   private async message(m: ServerMessage) {
     if (m.type === "error") {
+      this.note(`signaling error: ${m.code}`);
       if (m.code === "host-unavailable") {
         this.on.status("Laptop Monitor is not running on the host yet. Waiting…");
         this.ws?.close();
@@ -254,6 +341,8 @@ export class Session {
       this.mark("signalingMs");
       this.retry = 0;
       this.on.error("");
+      this.features = Array.isArray(m.features) ? m.features.filter((f) => typeof f === "string") : [];
+      this.startHeartbeat();
       if (m.role === "viewer" && m.token) {
         this.token = m.token;
         if (m.room) this.room = m.room;
@@ -267,132 +356,44 @@ export class Session {
           }),
         );
       }
-      this.on.status(this.credentials.role === "host" ? "Code published. Waiting for the receiver…" : "Paired. Waiting for the host…");
+      if (this.live()) this.sendState(true);
+      else this.on.status(this.credentials.role === "host" ? "Code published. Waiting for the receiver…" : "Paired. Waiting for the host…");
       return;
     }
     if (m.type === "peer-left") {
+      if (this.live()) {
+        this.note("host's signaling connection dropped; media still up");
+        return;
+      }
       this.resetPeer();
       this.phase("busy");
       this.on.status("Other laptop disconnected. Waiting for it to return…");
       return;
     }
     if (m.type === "ready") {
-      this.resetPeer();
-      for (const key of ["peerAvailableMs", "sdpMs", "iceMs", "webrtcMs", "firstVideoMs", "iceDurationMs"])
-        delete this.stages[key];
-      this.iceStarted = undefined;
-      this.mark("peerAvailableMs");
-      this.generation = m.generation;
-      const pc = (this.pc = new RTCPeerConnection({
-        iceServers: ice.iceServers,
-      }));
-      const generation = m.generation;
-      this.on.status("Establishing direct connection…");
-      pc.oniceconnectionstatechange = () => {
-        if (this.pc !== pc) return;
-        if (pc.iceConnectionState === "checking" && this.iceStarted === undefined) this.iceStarted = performance.now();
-        if (["connected", "completed"].includes(pc.iceConnectionState)) {
-          if (this.stages.iceDurationMs === undefined && this.iceStarted !== undefined)
-            this.stages.iceDurationMs = performance.now() - this.iceStarted;
-          this.mark("iceMs");
-        }
-        this.connectionStats();
-      };
-      pc.onicecandidate = (e) => {
-        if (this.pc === pc && e.candidate)
-          this.send({
-            type: "ice",
-            generation,
-            candidate: e.candidate.candidate,
-            mid: e.candidate.sdpMid ?? "0",
-          });
-      };
-      pc.ontrack = (e) => {
-        if (this.pc !== pc) return;
-        const receiver = e.receiver as RTCRtpReceiver & {
-          jitterBufferTarget?: number;
-        };
-        if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
-        this.on.video(e.streams[0] ?? new MediaStream([e.track]));
-      };
-      pc.ondatachannel = (e) => this.data(e.channel);
-      pc.onconnectionstatechange = () => {
-        if (this.pc !== pc) return;
-        const text = CONNECTION_TEXT[pc.connectionState];
-        if (text) this.on.status(text);
-        this.connectionStats();
-        if (pc.connectionState === "connected") {
-          clearTimeout(this.deadline);
-          this.on.error("");
-          this.mark("webrtcMs");
-          this.phase("connected");
-        } else if (pc.connectionState !== "new" && pc.connectionState !== "connecting") this.phase("busy");
-        if (pc.connectionState === "failed") this.reconnectDirect();
-        if (pc.connectionState === "disconnected") {
-          clearTimeout(this.deadline);
-          this.deadline = setTimeout(
-            () => this.reconnectDirect(),
-            ice.connectionTimeoutMs,
-          );
-        }
-      };
-      this.deadline = setTimeout(() => {
-        if (this.pc === pc && pc.connectionState !== "connected")
-          this.reconnectDirect();
-      }, ice.connectionTimeoutMs);
-      const stats = new ReceiverStats();
-      let sampling = false;
-      this.statsTimer = setInterval(() => {
-        if (sampling) return;
-        sampling = true;
-        void stats
-          .sample(pc)
-          .then((s) => {
-            if (!s || this.pc !== pc) return;
-            this.on.diagnostics(s.diagnostics);
-            if (
-              this.channel?.readyState === "open" &&
-              this.channel.bufferedAmount < 4096
-            )
-              this.channel.send(JSON.stringify(s.telemetry));
-          })
-          .catch(() => {})
-          .finally(() => {
-            sampling = false;
-          });
-      }, 1000);
-      if (this.credentials.role === "host") {
-        if (!this.stream) throw Error("Missing test source");
-        for (const track of this.stream.getVideoTracks()) {
-          const sender = pc.addTrack(track, this.stream);
-          const transceiver = pc
-            .getTransceivers()
-            .find((t) => t.sender === sender)!;
-          const codecs = RTCRtpSender.getCapabilities("video")?.codecs.filter(
-            (c) => c.mimeType === "video/H264",
-          );
-          if (codecs?.length) transceiver.setCodecPreferences(codecs);
-        }
-        this.data(
-          pc.createDataChannel("telemetry", {
-            ordered: false,
-            maxRetransmits: 0,
-          }),
-        );
-        await pc.setLocalDescription(await pc.createOffer());
-        this.send({ type: "offer", sdp: pc.localDescription!.sdp });
+      if (m.resume && m.generation === this.generation && this.live()) {
+        this.note("signaling resumed; media connection kept");
+        return;
       }
+      this.generation = m.generation;
+      await this.createPeer();
       return;
     }
     if (m.generation !== this.generation || !this.pc) return;
     if (m.type === "offer" || m.type === "answer") {
-      await this.pc.setRemoteDescription({ type: m.type, sdp: m.sdp });
+      if (m.type === "offer" && this.pc.remoteDescription) {
+        // The host started over within the same generation (its media connection had gone): so do we.
+        this.note("host renegotiated; new media connection");
+        await this.createPeer();
+      }
+      const pc = this.pc!;
+      await pc.setRemoteDescription({ type: m.type, sdp: m.sdp });
       this.mark("sdpMs");
-      for (const c of this.pending) await this.pc.addIceCandidate(c);
+      for (const c of this.pending) await pc.addIceCandidate(c);
       this.pending = [];
       if (m.type === "offer") {
-        await this.pc.setLocalDescription(await this.pc.createAnswer());
-        this.send({ type: "answer", sdp: this.pc.localDescription!.sdp });
+        await pc.setLocalDescription(await pc.createAnswer());
+        this.send({ type: "answer", sdp: pc.localDescription!.sdp });
       }
     } else if (m.type === "ice") {
       const c = { candidate: m.candidate, sdpMid: m.mid };
@@ -400,7 +401,127 @@ export class Session {
       else if (this.pending.length < 128) this.pending.push(c);
     }
   }
+  /** A fresh RTCPeerConnection for the current generation (and, as the test host, the offer). */
+  private async createPeer() {
+    this.resetPeer();
+    for (const key of ["peerAvailableMs", "sdpMs", "iceMs", "webrtcMs", "firstVideoMs", "iceDurationMs"])
+      delete this.stages[key];
+    this.iceStarted = undefined;
+    this.mark("peerAvailableMs");
+    const pc = (this.pc = new RTCPeerConnection({
+      iceServers: ice.iceServers,
+    }));
+    const generation = this.generation;
+    this.note(`negotiating (generation ${generation.slice(0, 8)})`);
+    this.on.status("Establishing direct connection…");
+    pc.oniceconnectionstatechange = () => {
+      if (this.pc !== pc) return;
+      if (pc.iceConnectionState === "checking" && this.iceStarted === undefined) this.iceStarted = performance.now();
+      if (["connected", "completed"].includes(pc.iceConnectionState)) {
+        if (this.stages.iceDurationMs === undefined && this.iceStarted !== undefined)
+          this.stages.iceDurationMs = performance.now() - this.iceStarted;
+        this.mark("iceMs");
+      }
+      if (["disconnected", "failed"].includes(pc.iceConnectionState)) this.note(`ICE ${pc.iceConnectionState}`);
+      this.connectionStats();
+    };
+    pc.onicecandidateerror = (e) => {
+      // Usually a STUN server that cannot be reached; logged once per kind so a blocked network is on record.
+      const text = `candidate error ${e.errorCode} ${e.errorText}`;
+      if (text !== this.lastCandidateError) {
+        this.lastCandidateError = text;
+        this.note(text);
+      }
+    };
+    pc.onicecandidate = (e) => {
+      if (this.pc === pc && e.candidate)
+        this.send({
+          type: "ice",
+          generation,
+          candidate: e.candidate.candidate,
+          mid: e.candidate.sdpMid ?? "0",
+        });
+    };
+    pc.ontrack = (e) => {
+      if (this.pc !== pc) return;
+      const receiver = e.receiver as RTCRtpReceiver & {
+        jitterBufferTarget?: number;
+      };
+      if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
+      this.on.video(e.streams[0] ?? new MediaStream([e.track]));
+    };
+    pc.ondatachannel = (e) => this.data(e.channel);
+    pc.onconnectionstatechange = () => {
+      if (this.pc !== pc) return;
+      const text = CONNECTION_TEXT[pc.connectionState];
+      if (text) this.on.status(text);
+      this.connectionStats();
+      this.note(`WebRTC ${pc.connectionState}`);
+      if (pc.connectionState === "connected") {
+        clearTimeout(this.deadline);
+        this.on.error("");
+        this.mark("webrtcMs");
+        this.phase("connected");
+        this.sendState(true);
+      } else if (pc.connectionState !== "new" && pc.connectionState !== "connecting") {
+        this.phase("busy");
+        this.sendState(false);
+        // Without media there is nothing left to keep the signaling socket optional for.
+        if (this.ws?.readyState !== WebSocket.OPEN && pc.connectionState !== "disconnected") this.resetPeer();
+      }
+      if (pc.connectionState === "failed") this.reconnectDirect();
+      if (pc.connectionState === "disconnected") {
+        clearTimeout(this.deadline);
+        this.deadline = setTimeout(
+          () => this.reconnectDirect(),
+          ice.connectionTimeoutMs,
+        );
+      }
+    };
+    this.deadline = setTimeout(() => {
+      if (this.pc === pc && pc.connectionState !== "connected") this.reconnectDirect();
+    }, ice.connectionTimeoutMs);
+    const stats = new ReceiverStats();
+    let sampling = false;
+    this.statsTimer = setInterval(() => {
+      if (sampling) return;
+      sampling = true;
+      void stats
+        .sample(pc)
+        .then((s) => {
+          if (!s || this.pc !== pc) return;
+          this.on.diagnostics(s.diagnostics);
+          this.sendToHost({ ...s.telemetry, events: this.events });
+        })
+        .catch(() => {})
+        .finally(() => {
+          sampling = false;
+        });
+    }, 1000);
+    if (this.credentials.role === "host") {
+      if (!this.stream) throw Error("Missing test source");
+      for (const track of this.stream.getVideoTracks()) {
+        const sender = pc.addTrack(track, this.stream);
+        const transceiver = pc
+          .getTransceivers()
+          .find((t) => t.sender === sender)!;
+        const codecs = RTCRtpSender.getCapabilities("video")?.codecs.filter(
+          (c) => c.mimeType === "video/H264",
+        );
+        if (codecs?.length) transceiver.setCodecPreferences(codecs);
+      }
+      this.data(
+        pc.createDataChannel("telemetry", {
+          ordered: false,
+          maxRetransmits: 0,
+        }),
+      );
+      await pc.setLocalDescription(await pc.createOffer());
+      this.send({ type: "offer", sdp: pc.localDescription!.sdp });
+    }
+  }
   private reconnectDirect() {
+    this.note(`direct connection failed (ICE ${this.pc?.iceConnectionState ?? "none"}); rejoining for a new negotiation`);
     this.on.error(DIRECT_FAILURE);
     this.stages.label = "Failed";
     this.phase("busy");
@@ -408,6 +529,10 @@ export class Session {
     // Rejoining creates a fresh generation and triggers a new host offer.
     // Leave the failure visible before retrying; never substitute a relay.
     clearTimeout(this.retryTimer);
-    this.retryTimer = setTimeout(() => this.ws?.close(), 3000);
+    this.retryTimer = setTimeout(() => {
+      this.resetPeer();
+      if (this.ws?.readyState === WebSocket.OPEN) this.ws.close();
+      else this.start();
+    }, 3000);
   }
 }

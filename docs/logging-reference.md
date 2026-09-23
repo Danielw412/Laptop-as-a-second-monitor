@@ -366,32 +366,97 @@ for the same frames. Use them to compare with older logs; use the host-clock fie
 | `keyframe_bytes_mean` | rolling (256) | Keyframes only | 240–300 KB at 8 Mbps CBR |
 | `delta_bytes_mean` | rolling (256) | Delta frames only. **This is the one to watch for pixelation** | ~15 KB at 8 Mbps |
 | `frame_bytes_max` | interval | Largest frame this second | ≈ keyframe size |
-| `keyframes` | cumulative | Keyframes produced | +1 per 10 s, plus one per PLI/join/drop |
+| `keyframes` | cumulative | Keyframes produced | +1 per 20 s while streaming (the periodic refresh), plus one per join, PLI/FIR, recovery or broken chain |
 | `encoded_bits_per_second` | derived | `encode_fps × frame_bytes_mean × 8`. Approximate (the mean is rolling), but it is what the receiver actually gets | near `bitrate` |
+| `qp_mean` / `qp_p95` / `qp_max` | interval | The QP of each frame encoded this second: the encoder's own per-frame value (`MFSampleExtension_VideoEncodeQP`, which Quick Sync reports), else the slice header's. **This is pixelation measured at the source**; it holds on a perfect network. Null when no frame was encoded | 25–38. 44+ is flat 16x16 blocks wherever the picture changes |
+| `qp_coarse_frames` / `qp_severe_frames` | interval | Frames at QP ≥ 40 / ≥ 46 | 0 while content changes |
+| `idr_frames` | interval | IDR frames this second | 0, occasionally 1 |
+| `unparsed_frames` | interval | Frames whose slice header the parser could not read (no parameter set yet, malformed) | 0 |
+| `slices_per_frame_max` | interval | Slices in the frame with the most. Quick Sync writes one | 1 |
+| `delta_frame_bytes_max` | interval | Largest non-IDR frame. A window switch produces a near-keyframe-sized P-frame | — |
 
-### Bitrate and encoder churn
+Why the encoder's QP and not the slice header's: Quick Sync keeps `slice_qp_delta` at 0 (every slice reads QP 26)
+and varies QP per macroblock, so the header says nothing. The frame QP it reports on each output sample is the one
+that matched the damage in the 2026-09-22 measurements (below, "Diagnosed 2026-09-22").
+
+### Bitrate, adaptation and encoder churn
 
 | Field | Window | Meaning |
 | --- | --- | --- |
 | `bitrate` | — | What the encoder is **actually** configured at |
-| `target_bitrate` | — | What `BitrateController` wants |
-| `dynamic_bitrate` | — | `false` once the encoder refused a live change. **On Intel this goes false almost immediately and stays false** |
-| `encoder_rebuilds` | cumulative (engine) | Times the encoder was recreated. Each one is a visible hitch, and each starts a new `pipeline_session` with reason `encoder_rebuild` |
+| `target_bitrate` / `adaptation_target_bitrate` | — | What `NetworkAdaptation` wants (the same value; the first is kept for older tooling) |
+| `stream_fps` / `stream_height` | — | The shape the encoder was built with: the ladder gives up frame rate first, then resolution, when the target cannot carry 1080p60 |
+| `adaptation_congested` / `adaptation_reason` | interval | Whether this second counted as congestion, and why: `loss`, `delay`, `recovery`, `probe`, or empty |
+| `adaptation_clean_seconds` | — | Consecutive clean seconds; recovery needs 10, a step above the configured bitrate 20 |
+| `network_source` | interval | Where the network numbers came from: `rtcp` (the receiver's RTCP reports, read on the host), `receiver` (its telemetry message, when no report arrived) or `none` |
+| `network_loss` / `network_packets` | interval | Loss fraction and the packets it is over, from the cumulative counters of consecutive receiver reports |
+| `network_rtt_ms` | interval | Round-trip time from the receiver reports' LSR/DLSR against the host's sender reports: the **minimum** over the second, because a busy receiver sends some reports late (seen: 200 ms spikes on loopback while its decoder was saturated) |
+| `network_rtt_baseline_ms` | rolling (60 samples) | This link's own minimum RTT; queueing delay is measured against it |
+| `network_jitter_ms` | instant | Interarrival jitter from the latest receiver report. **Not an adaptation input** (see below) |
+| `nacked_packets_interval` / `pli_interval` / `fir_interval` | interval | Packets asked for again, and keyframe requests, parsed from RTCP on the host |
+| `rtcp_reports_interval` | interval | Receiver reports that arrived. 0 while connected means the host is flying blind |
+| `sent_bps` | interval | Encoded bytes actually handed to the network this second |
+| `dynamic_bitrate` | — | `false` once the encoder refused a live change. **On Intel this goes false immediately and stays false** |
+| `encoder_rebuilds` | cumulative (engine) | Times the encoder was recreated. Each one is a visible hitch (250-400 ms), and each starts a new `pipeline_session` with reason `adaptation` |
 | `encoder_rebuild_ms_mean` | rolling (64) | How long the stream was dark per rebuild |
-| `build_ms` | — | Cost of standing this pipeline up (device + capture + converter + encoder). ~710 ms here; `host.log` breaks it into the four stages, and the encoder stage usually dominates — which is why a rebuild is expensive rather than free |
+| `build_ms` | — | Cost of standing this pipeline up (device + capture + converter + encoder); `host.log` breaks it into the four stages, and the encoder stage dominates — which is why a rebuild is expensive rather than free |
 | `first_encoded_ms`, `first_sent_ms` | — | From pipeline ready to the first frame out. `null` until it happens |
 
-`BitrateController` (`host/include/core.hpp`) cuts to 75% when loss > 5%, smoothed loss > 2.5%, RTT > 250 ms or
-jitter > 40 ms; it raises by 250 kbps after 8 consecutive good samples **that also used at least 75% of the
-current target bitrate**. Demand is successful encoded bytes sent divided by host elapsed time between admitted
-telemetry messages (0.5-3 seconds). The first sample after peer reset, stale intervals and quiet intervals do not
-earn growth and reset the consecutive-good count. These sender counters now explicitly control upward adaptation;
-REMB, receiver throughput and the other diagnostic fields remain reporting only. Cuts do not require demand.
-This avoids rebuilding a lightly used encoder just because an idle link has low loss and RTT.
-Because `dynamic_bitrate` is false on this
-encoder, the engine instead recreates it — but only after 5 s and only if the target is ≤ 75% or ≥ +2 Mbps of the
-current rate. Demand gating reduces unnecessary upward rebuilds; it does not fix all loss-driven oscillation
-described under "Known pathology" below.
+`NetworkAdaptation` (`host/include/core.hpp`, unit tested) replaced `BitrateController` on 2026-09-22. It acts on
+two kinds of evidence only:
+
+- **Loss**: at least 5% of at least 50 packets this second, or at least 1% while the smoothed loss is at least 2%.
+- **Queueing delay**: RTT at least `baseline + max(80 ms, baseline)` in three consecutive seconds. One or two slow
+  seconds are a receiver that stalled and sent its reports late (seen on loopback: 714 and 484 ms while the
+  receiving browser caught up after an encoder rebuild), not a queue.
+
+On either it cuts to 75% of what was actually being sent (not of a target an idle desktop never used), then holds for
+3 s so the queue can drain. After 10 clean seconds it recovers ×1.3 towards the configured bitrate; above it, it
+probes ×1.4 up to the preset maximum after 20 clean seconds, and only while the encoder used at least 75% of the
+current target. Jitter and REMB are **not** inputs: on a clean LAN both swing with frame sizes (a 200 KB keyframe
+arrives as a burst), and acting on them is what cut a loss-free stream to 1.9 Mbps and held it there for two hours
+(see "Diagnosed 2026-09-22").
+
+The engine applies a target by rebuilding the encoder when it differs by more than 15% from the current bitrate or
+the stream shape changes, at most every 5 s (2 s for a congestion cut). The shape (`shapeFor`) drops to 30 fps below
+6 Mbps (or 75% of an Efficient preset's bitrate) and back at 1.2× that, and to 720p below 2.5 Mbps, back at 3 Mbps.
+Measured with the synthetic desktop: 4 Mbps at 30 fps (QP 39, 39.8 dB) looks like 8 Mbps at 60 fps (QP 39, 43.0 dB),
+while 4 Mbps at 60 fps sits at QP 44-49 (30.6 dB). A new connection after more than 10 s without one starts from the
+configured bitrate again.
+
+### Keyframes and the reference chain
+
+| Field | Window | Meaning | Healthy |
+| --- | --- | --- | --- |
+| `keyframes_forced` | cumulative (engine) | IDRs the keyframe policy asked the encoder for | join + 3/min |
+| `keyframe_requests_by_reason` | cumulative (engine) | Requests by reason, below | — |
+| `keyframe_requests_coalesced` | cumulative (engine) | Requests folded into an IDR already on its way, or spaced out (at most one forced IDR per 300 ms) | low |
+| `seconds_since_idr` | instant | Age of the newest IDR. The policy refreshes every 20 s while streaming | < 20 |
+| `frames_withheld` | cumulative (engine) | Delta frames not sent because a frame before them never reached the network: sent anyway, the receiver would decode them against the wrong picture (their RTP sequence numbers are continuous, so it cannot tell) | 0 |
+| `reference_chain_breaks` | cumulative (engine) | Sent frames whose `frame_num` does not follow the previous reference frame. Never expected; logged as an error | 0 |
+| `rtp_timestamps_adjusted` | cumulative (engine) | Frames whose sample time had to be pushed to one RTP tick after the previous frame. Two frames with the same RTP timestamp are one frame to a WebRTC receiver | ~0 |
+
+`keyframe_requests_by_reason` counts every request the policy saw by reason (`receiver` for PLI/FIR, `join`,
+`transport`, `host`, `periodic`, `chain`, `recovery`); `webrtc.keyframe_request_reasons` has only those that came
+through the transport.
+
+### Quality probes
+
+Every 10 s while a receiver is connected and diagnostics are on, the engine reads back one frame's NV12 surface (the
+exact input the encoder read) and its captured BGRA frame, computes a 32×18 luma grid of each (mean and detail per
+cell, `host/include/probe.hpp`), and asks the receiver for the same grid of the **decoded** frame with that RTP
+timestamp. The receiver reads it from the track (`MediaStreamTrackProcessor`, the decoder's own NV12 output, works
+while the page is hidden; Chrome and Edge) and replies; the host compares. The copies are asynchronous (queued on the
+GPU, mapped frames later without waiting) and cost about 2 MB of readback per probe.
+
+| Field | Window | Meaning | Healthy |
+| --- | --- | --- | --- |
+| `probes_sent` / `probes_missed` | cumulative (engine) | Probe requests sent / never answered with a grid (frame skipped by the receiver, browser without a track reader, old page) | missed ≈ 0 |
+| `probe_verdicts` | cumulative (engine) | Counts by verdict: `match`; `quantized` (content right, detail gone in ≥ 20% of detailed cells: too few bits); `corrupted` (some cells show different content: a stale or garbled band); `unrelated` (most cells differ: a different frame) | all `match` |
+| `probe_last` | latest | The newest comparison: verdict, frame, QP, bytes, mean/max difference, mismatched and flattened cells, the grid rows holding the damage (`bad_rows`), and the fitted gain/offset | — |
+| `probe_conversion_mismatches` | cumulative (engine) | Probes where the NV12 surface differed from the captured frame: the conversion stage changed the picture | 0 |
+| `receiver_marks` | cumulative (engine) | Times the person watching pressed M on the receiver (see "Marking a damaged picture") | — |
+| `flight_recorder_units` / `_bytes` | instant | The last seconds of the stream kept in memory for a mark (trimmed to about 24 MB at each IDR, always starting at one; up to about 20 s) | — |
 
 ### Engine thread cost
 
@@ -473,13 +538,15 @@ answer - a maximum over only some of them could hide the busy one.
 | Field | Window | Meaning |
 | --- | --- | --- |
 | `webrtc.sent_frames`, `.encoded_bytes_sent` | cumulative | What reached the wire |
-| `webrtc.transport_dropped` | cumulative | Frames refused because the send buffer was over 128 KB or the peer was down |
-| `webrtc.transport_buffer_bytes` | instant | Currently queued |
-| `webrtc.transport_buffer_pressure` | cumulative | Frames handed to the transport while over 32 KB was still queued (counted before the 128 KB refusal, so it includes frames then dropped) — latency the receiver feels |
-| `webrtc.keyframe_requests` / `.keyframes_sent` | cumulative | PLIs received / keyframes emitted. Each PLI costs a 240–300 KB, 20–30 ms frame |
-| `webrtc.bitrate_cuts` / `.bitrate_raises` | cumulative | Controller decisions |
-| `webrtc.smoothed_loss` / `.smoothed_rtt_ms` | rolling | The EWMA values the controller actually decided on — not the raw sample |
-| `webrtc.receiver_estimate_bps` | instant | The browser's REMB estimate. **Diagnostics only; nothing acts on it** |
+| `webrtc.transport_dropped` | cumulative | Frames not sent because the peer was down, plus frames whose last packet the socket refused. (A media track has no send buffer in libdatachannel: `bufferedAmount` is always 0, so the old 128 KB rule never fired and was removed with its `transport_buffer_*` fields) |
+| `webrtc.keyframe_requests` / `.keyframes_sent` | cumulative | Keyframe request batches taken by the engine / keyframes emitted |
+| `webrtc.keyframe_request_reasons` | cumulative | Requests by reason: `receiver` (PLI/FIR), `join`, `transport`, `host`, `periodic`, `chain`, `recovery` |
+| `webrtc.rtcp` | cumulative / instant | Parsed on the host from the receiver's RTCP: `reports`, `nack_messages`, `nacked_packets`, `pli`, `fir`, and the latest `rtt_ms`, `cumulative_lost`, `jitter_ms`. libdatachannel's own PLI handler, which this replaced, took payload type 196 for a FIR and never saw an RFC 5104 FIR |
+| `webrtc.webrtc_state` / `.signaling_state` | instant | The peer connection's and the signaling WebSocket's states |
+| `webrtc.signaling_drops` / `.signaling_resumed` / `.renegotiations` | cumulative | WebSocket closes, reconnects that kept the media connection (no renegotiation), and new peer connections |
+| `webrtc.media_interruptions` | cumulative | Times the peer connection went `disconnected` (ICE consent failing) |
+| `webrtc.receiver_away` | instant | The receiver's signaling socket dropped while its media connection is still up |
+| `webrtc.receiver_estimate_bps` | instant | The browser's REMB estimate. **Diagnostics only; nothing acts on it** (it read 46 kbps on a loss-free 2 Mbps LAN stream) |
 | `webrtc.route` | instant | Selected ICE pair, e.g. `host -> host over UDP`. A `relayed` or TCP pair explains latency that is not the encoder's fault |
 | `webrtc.receiver_age_ms` | instant | Time since the receiver's latest telemetry arrived. Null before the first |
 | `webrtc.timings` | — | `answer_ms`, `connected_ms`, `first_sent_ms`, `first_keyframe_ms`, `keyframe_response_ms`, all from the start of this peer connection |
@@ -504,7 +571,7 @@ Hoisted to the top level for convenience: `receiver_qp`, `receiver_corrupted`, `
 | Field | Window | Meaning | Healthy |
 | --- | --- | --- | --- |
 | `qp` | interval | Mean quantizer the decoder saw. **This is pixelation itself, measured** | 20–30; over ~36 is visibly blocky. Chrome did not publish `qpSum` for this H.264 stream in the 2026-09-18 local test, so it read null |
-| `corrupted` | interval | Frames that arrived but never decoded | 0 |
+| `corrupted` | interval | Frames received minus frames decoded over the interval. Despite the name this is usually one frame still in flight at the sampling instant; it read 1 in ~280 of 9500 seconds of a loss-free session. Not a quality signal (the dashboard calls it "Undecoded frames") | 0–1 |
 | `freezes` | interval | Freeze events (the browser's definition: a frame much later than the recent average) | 0 |
 | `freezeMs` | interval | How long the picture was frozen in total | 0 |
 | `pauses`, `pauseMs` | interval | No frame for 5 s or more, and how long. **A still desktop produces pauses**; read with the host's source activity | — |
@@ -523,6 +590,7 @@ Hoisted to the top level for convenience: `receiver_qp`, `receiver_corrupted`, `
 | `decodeMs`, `processingMs` | interval | Receiver-side decode and packet-to-frame delay | — |
 | `dropped` | interval | Frames dropped at the receiver | 0 |
 | `decoded` | **cumulative** | `framesDecoded` since the stream started (the one cumulative field; the interval count is `intervalFramesDecoded`) | — |
+| `events` | ring | The receiver's own account of what happened, repeated until it ages out: connection and ICE states, WebSocket closes with code and reason, heartbeat timeouts, the page hidden or shown, the network going away, marks. The host logs each once as `Receiver event:`. Not copied into `perf.jsonl` | — |
 
 A counter that goes *down* between two samples belongs to a new stream, so that interval is null rather than zero or
 negative. The one exception is `packetsLost`, which legitimately falls when duplicates arrive; that interval counts 0.
@@ -596,65 +664,89 @@ This is the record of what the app costs sitting in the tray — most of its lif
 | `Earlier run` | A previous run died without closing its archive |
 | `Session archive unavailable` | The archive could not be created; the rolling logs still work |
 | `GPU engine utilization unavailable` | Why no `gpu_engine_*` fields appear |
-| `Recreating hardware encoder` | A rebuild, with the receiver numbers that caused it |
+| `Encoder configuration:` | What the encoder reports after configuration (rate control, mean/peak bitrate, VBV buffer, QP limits, GOP) and which options it refused |
+| `Encoder output sample attributes:` | Once per encoder: the per-frame facts it attaches (the QP one is `{B2EFE478-...}`) |
+| `Capture surface:` | Size, DXGI format, bind and misc flags of the captured texture, once per pipeline and on change |
+| `NV12 readback:` | The row and depth pitch the driver really uses for the NV12 surface, from the first probe |
+| `Recreating hardware encoder` | A rebuild: bitrate, frame rate and resolution before and after, and the reason |
 | `Encoder rebuild interrupted the stream for` | How long the picture was actually gone |
-| `Bitrate target cut` | Controller reduced the target (rate-limited to one line per 5 s) |
-| `Receiver asked for N keyframes in` | PLI storm — each one is a full intra frame |
-| `Send queue was still draining` | The link cannot carry the current bitrate |
+| `Bitrate target now` / `Congestion signal held` | An adaptation decision with the evidence: loss over how many packets, RTT against the baseline, NACKs, what was sent |
+| `Receiver asked for N keyframes in` | PLI/FIR storm — each one is a full intra frame |
+| `Quality probe (frame N, QP q, B bytes): receiver <verdict>` | A probe result; `match` at debug level, anything else as a warning with the damaged grid rows |
+| `Probe: the NV12 surface the encoder read differs from the captured frame` | The conversion stage changed the picture |
+| `Receiver marked a damaged picture` | The M key: where the flight recorder and the source frames were written |
+| `Signaling connection lost (<why>, open N s, M messages)` | The WebSocket went; says whether the media connection was kept |
+| `Room authenticated (worker keeps sessions)` | The worker supports resume; `media connection still up` when reconnecting under a live stream |
+| `Signaling resumed; the media connection was kept` | A reconnect that did not cost any video |
+| `Receiver's signaling connection dropped; its media connection is still up` | The receiver's WebSocket went, the video did not |
+| `Direct WebRTC disconnected` / `recovered after` / `closed by the receiver` | Media connection states, with the libdatachannel lines around them saying why |
+| `Receiver event:` | One entry from the receiver's event ring, with the receiver's clock |
+| `libdatachannel:` | The library's own ICE, DTLS, SCTP and WebSocket messages (debug level; warnings and errors at their own), rate limited to 40 per 10 s |
+| `Engine thread has not finished a loop iteration for N s (stage: ...)` / `Engine thread resumed after` | The stall watchdog: what the engine thread was doing while frames, signaling and keyframe requests waited |
 | `Picture quality dropped` / `Picture quality recovered` | See below |
 | `Pipeline session ended after` | One-line totals for the session that just ended |
-| `Capture source timestamps are not comparable` | Source stamps were discarded; `acquire_delay_ms_*` is then empty |
+| `Capture source timestamps are not comparable` | Source stamps ran ahead of the host clock and were discarded (a frame that merely waited in the pool while nobody was watching no longer triggers it) |
 | `Display topology changed` | The pipeline was torn down and rebuilt; counters restart |
 
 ## Picture quality episodes
 
-`QualityWatch` in `host/src/pipeline.cpp` exists for one specific complaint: *"it goes extremely pixelated and
-glitchy, then fixes itself."* Those are two different faults that look alike and are both over before anyone can
-look at a dashboard.
+`QualityWatch` in `host/src/pipeline.cpp` exists for one complaint: *"it goes extremely pixelated and glitchy, then
+fixes itself."* It opens an episode on the first of these, in this order, and closes it after 3 clean seconds with
+one attributed line:
 
-- **Pixelation** — the encoder has too few bits for 1080p, raises the quantizer, and the picture turns to blocks.
-  Seen as `delta_bytes_mean` and `encoded_bits_per_second` collapsing, and `receiver_qp` climbing.
-- **Glitching** — packets were lost, so the decoder shows torn and smeared blocks until a keyframe repairs it.
-  Seen as `receiver_corrupted`, `receiver_freezes` and `keyframe_requests`.
-
-The watch opens an episode when the receiver's quantizer exceeds 36, or the encoded rate falls below 55% of the
-healthy baseline (the mean of the last 64 healthy seconds, armed after 10 samples), or frames are corrupted or
-frozen. It closes after 3 consecutive clean seconds and writes one attributed line. Both lines end with what the
-**source** was doing, so an episode that is really a still desktop can be recognised:
+1. a quality probe found the receiver showing different content than was encoded (`corrupted`/`unrelated`);
+2. packet loss of at least 2% over at least 50 packets (from RTCP);
+3. a PLI or FIR from the receiver;
+4. encoder QP ≥ 44 while the source is changing (≥ 10 new frames that second);
+5. receiver freezes while the source is changing.
 
 ```
-[warn ] Picture quality dropped: encoded rate fell to 0.1 Mbps from a usual 0.4 Mbps | encoder 8000 kbps ...
-        | host encode 2 fps, queue 0 | source: 2 new source frames in the last second, newest 0.1 s ago,
-        0 repeat encodes, user input 2418.8 s ago
-[info ] Picture quality recovered after 14 s (started: ...) | worst quantizer 44, lowest encoded rate 1.31 Mbps |
-        encoder was recreated 2 time(s) at a lower bitrate: too few bits for this resolution |
-        source: 2.4 new frames/s over the 12 degraded seconds, none at all in 3 of them
+[warn ] Picture quality dropped: encoder quantizer 50 at 1898 kbps (flat blocks where the picture changes) |
+        encoder 1898 kbps (target 1898), 60 fps, QP 50 | network rtcp: loss 0.00%, rtt 1 ms, NACKed 0 | ...
+[info ] Picture quality recovered after 14 s (started: ...) | too few bits for what changed on screen (encoder QP
+        up to 50) | worst QP 50, lowest encoded rate 1.31 Mbps, 0 encoder rebuilds, 12 degraded seconds
 ```
 
-A still desktop trips the watch by design of its triggers: the encoded rate collapses to the keep-alive repeats,
-and the receiver counts the long gaps between frames as freezes (and, past 5 s, pauses). Observed 2026-09-18 on a
-nearly still display: repeated "encoded rate fell to 0.1 Mbps" episodes with the source at 2-3 new frames per second
-and nobody touching the input. The triggers were deliberately left as they were; the source context is what tells
-such an episode from a real one.
+The old triggers (receiver `corrupted`, and the encoded rate falling below a baseline) are gone: the first counted a
+frame in flight as damage, and the second fired on every calmer stretch of desktop. A still desktop no longer opens
+episodes, because both remaining freeze and QP triggers require the source to be changing.
 
-It deliberately survives a pipeline rebuild, because a rebuild is usually *part* of the episode rather than the
-end of it. The thresholds are heuristics chosen from one machine — treat a single episode as a pointer to the
-`perf.jsonl` window around it, not as a verdict.
+## Diagnosed 2026-09-22
 
-## Known pathology, not yet fixed
+The session `20260922-143412-22380` (2 h 42 min, 9531 records) reproduced both complaints. What the logs showed:
 
-Visible in the logs **before** any of this instrumentation existed, and left alone deliberately:
+- **No packet loss at all**: `intervalPacketsLost` summed to 0 over 1.33 million packets; 4 NACKs, 0 PLI, 0 FIR.
+  The receiver's `corrupted` (1 in 280 seconds) was frames in flight, not damage.
+- **The bitrate collapsed anyway**: `BitrateController` cut 8 → 6 → 4.5 → 3.4 → 2.5 → 1.9 Mbps on jitter over
+  40 ms, RTT over 250 ms or one 9.6% loss sample, never on sustained loss, and could not climb back: raising required
+  2 Mbps of headroom for a rebuild and 75% usage for growth, so the stream sat at 1.9 Mbps for over two hours.
+- **1.9 Mbps is the picture described**: with the synthetic desktop (`bench --synthetic --content desktop --bitrate
+  1898437 --record ...`, analysed with `scripts/analyze-recording.py`) Quick Sync encodes every frame at QP 50 of 51;
+  luma PSNR 22.5 dB. The decoded recording — exactly what a loss-free receiver shows — has rectangles of crisp but
+  stale text from earlier frames next to smeared blocks, while the NV12 input it was encoded from is correct. The
+  damage is made inside the encoder by rate-control starvation, not by capture, conversion or the network.
+- **Disconnects**: all three mid-session drops were the **signaling** WebSocket closing (host side at 15:43, 16:39,
+  17:09; the receiver's at 16:08). Both ends then tore down a healthy media connection and renegotiated; the first
+  attempt after each drop often failed, so one outage lasted 95 s.
 
-> The Intel MFT reports `AVEncCommonMeanBitRate` as not modifiable while streaming, so `dynamic_bitrate` goes
-> false and every adaptation becomes a full encoder rebuild. `BitrateController` then oscillates, and the 5-second
-> hysteresis is short enough to let it: the log shows the encoder recreated every ~5 s, alternating roughly
-> 1.5 ↔ 3.5 Mbps. 1080p at 1.5 Mbps is blocky, and each rebuild is a visible hitch — which matches the
-> pixelation complaint exactly.
+What changed: `NetworkAdaptation` and the stream-shape ladder (above), per-frame QP and probes to see the result,
+and a signaling protocol that keeps a working media connection across WebSocket drops (`README.md`, "Connection").
 
-Confirm it from a fresh session before acting: correlate `pipeline_session` stepping up with
-`pipeline_build_reason == "encoder_rebuild"`, `receiver_qp` rising and `delta_bytes_mean` collapsing in the same
-seconds. If that correlation holds, the fault is in the adaptation policy, not in capture, conversion or the
-encoder's throughput.
+## Marking a damaged picture
+
+Press **M** on the receiver's stage when the picture looks wrong. The receiver sends a mark with the RTP timestamp
+of the next decoded frame and saves that frame as a PNG (`laptop-monitor-mark-<time>-rtp<n>.png` in its downloads).
+The host writes, into `marks/<time>/` next to its logs (the run's archive folder):
+
+- `stream.h264` and `stream.jsonl`: the last 20 s or so of exactly what was sent, starting at an IDR, one index line
+  per frame (sequence, RTP timestamp, bytes, IDR, QP);
+- `captured-<seq>.bmp` and `encoder-input-<seq>.bmp`: the next source frame as captured and as the encoder read it.
+
+Decode the stream (`ffmpeg -i stream.h264 frames/%05d.png`) and compare. Damage in the decoded stream was made by
+the encoder (QP in `stream.jsonl` says whether it was starved); a clean decoded stream with damage in the receiver's
+PNG points at transmission or the receiver's decoder; a damaged `captured` frame points at capture. For a controlled
+run the bench records the whole stream plus sampled source surfaces, and `python scripts/analyze-recording.py
+out.h264` reports PSNR per horizontal band between the two.
 
 ## Attributing a problem
 
@@ -666,9 +758,12 @@ A starting point for the question "where is it", with the fields that decide it:
 | Conversion | `convert_submit_ms_mean`, `gpu_command_span_ms_mean`, `gpu_engine_video_processing_*` | Submit is slow, or the video-processing engine is saturated |
 | Encoder | `encode_ms_*` minus `encoder_output_pickup_ms_*`, `keyframe_encode_ms_mean`, `dropped_superseded`, `dropped_ring_busy`, `queue_depth`, the engine class carrying encode (`video_decode` on Intel) | The encoder's own time is high or its engine is saturated |
 | Host scheduling / GPU contention | `encoder_output_pickup_ms_*`, `host_acquire_to_convert_ms_*`, `loop_max_ms`, `loop_busy_percent`, the scheduling line, `gpu_engine_*_system_percent` versus `_percent`, `cpu_percent` | Frames and outputs wait for this thread, or another process owns the engines |
-| Transport / network | `encoded_to_send_ms_*`, `send_ms_*`, `transport_buffer_*`, `transport_dropped`, `route`, receiver `loss`, `rttMs`, `jitterMs`, `intervalPacketsLost`, `nack` | Send or buffering grows, or the receiver reports loss and jitter |
+| Transport / network | `encoded_to_send_ms_*`, `send_ms_*`, `transport_dropped`, `route`, `network_loss`, `network_rtt_ms` against `network_rtt_baseline_ms`, `nacked_packets_interval`, `pli_interval`, receiver `intervalPacketsLost` | RTCP reports loss or a queue (RTT well above the baseline), or sends are refused |
 | Receiver decode / render | receiver `decodeMs`, `processingMs`, `jitterBufferMs`, `interFrameDelayStdMs`, `freezeMs`, `intervalFramesDecoded` versus `intervalFramesReceived`, `dropped`, `decoder` | Frames arrive on time but decode late, are dropped, or are shown unevenly |
-| Bitrate controller / rebuilds | `pipeline_session`, `pipeline_build_reason`, `encoder_rebuilds`, `bitrate`, `target_bitrate`, `bitrate_cuts`, `encoder_rebuild_ms_mean` | Rebuilds line up with the complaint |
+| Encoder quantization | `qp_mean`, `qp_severe_frames`, `bitrate`, `stream_fps`, probe `quantized` or `corrupted` with a high `probe_last.qp` and no loss | QP ≥ 44 while the picture changes; the recording shows the damage too |
+| Stage by stage, one frame | `probe_last`, `probe_verdicts`, `probe_conversion_mismatches`, a mark's `marks/` folder | The first stage whose picture differs from the one before it |
+| Adaptation / rebuilds | `pipeline_session`, `pipeline_build_reason`, `encoder_rebuilds`, `bitrate`, `target_bitrate`, `adaptation_reason`, `network_*`, `encoder_rebuild_ms_mean` | Rebuilds or a low target line up with the complaint |
+| Disconnects | `Signaling connection lost`, `Receiver event:`, `libdatachannel:` lines, `webrtc.signaling_drops`, `.media_interruptions`, `.renegotiations` | Which side's connection went first, and whether the media connection went with it |
 
 ## What is *not* measured
 
@@ -678,7 +773,8 @@ Do not infer these from anything above:
   `gpu_command_span_ms_mean` includes driver submission delay and is not an engine duration either.
 - **Time in the WGC frame pool before the engine took a frame, on the host clock.** The only stamp for it is the
   compositor's vsync target (`acquire_delay_ms_*`), which is a different quantity.
-- **Time on the wire.** "Sent" is `transport->send()` returning; RTT and jitter come from the receiver.
+- **Time on the wire.** "Sent" is `transport->send()` returning; RTT comes from RTCP receiver reports (see
+  `network_rtt_ms` for why it is a per-second minimum) and jitter from the receiver.
 - **Per-frame receiver timing.** The receiver reports interval aggregates; there is no end-to-end glass-to-glass
   number, because the two machines share no clock.
 - **Per-thread CPU.** `cpu_percent` covers the whole process. The engine thread's share can only be bounded by
@@ -688,7 +784,7 @@ Do not infer these from anything above:
 - **The receiver's machine.** Only what the browser's `getStats()` publishes crosses the data channel; the decoder's
   name is usually withheld by the browser.
 - **Network path.** RTT, loss and the ICE pair type are all that is known; there is no path MTU, pacing or
-  congestion-window visibility.
+  congestion-window visibility. Packets are not paced: a keyframe leaves as a burst.
 
 ## Where the code is
 
@@ -703,9 +799,14 @@ Do not infer these from anything above:
 | `LatencyTrack`, `SourceActivity`, `busyPercent` (portable, unit tested) | `host/include/core.hpp` |
 | `FrameTrace` and where the encoder carries it | `host/include/platform.hpp`, `host/src/encoder.cpp` |
 | Snapshot shared with the GUI | `host/include/metrics.hpp` |
-| Transport counters, ICE route, pressure reporting, receiver age | `host/src/transport.cpp` |
-| Bitrate policy | `BitrateController` in `host/include/core.hpp` |
-| Receiver-side counters | `viewer/src/telemetry.ts`, `Telemetry` in `shared/protocol.ts` |
+| Transport counters, ICE route, RTCP parsing, signaling resume, receiver events | `host/src/transport.cpp`, `host/include/rtcp.hpp` |
+| Adaptation, stream shape, keyframe policy, RTP sample times | `NetworkAdaptation`, `shapeFor`, `KeyframePolicy`, `nextSampleTime` in `host/include/core.hpp` |
+| H.264 inspection (NAL types, slice QP, `frame_num` chain) | `host/include/h264.hpp` |
+| Probe grids and their comparison | `host/include/probe.hpp`, `viewer/src/probe.ts` |
+| Surface readback, BMP/raw dumps, bitstream and flight recorders | `host/include/frame_diagnostics.hpp`, `host/src/frame_diagnostics.cpp` |
+| Synthetic test content (bar, scroll, desktop) | `host/include/synthetic.hpp`, `host/src/synthetic.cpp` |
+| Offline stream-versus-source comparison | `scripts/analyze-recording.py` |
+| Receiver-side counters and events | `viewer/src/telemetry.ts`, `viewer/src/session.ts`, `Telemetry` in `shared/protocol.ts` |
 | Window paint cost | `reportUiCost()` in `host/app/ui/main_window.cpp` |
 
 Adding a field: put it in the `stats` object in `pipeline.cpp` (it reaches `perf.jsonl`, the archive, the bench JSON

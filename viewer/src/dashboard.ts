@@ -46,13 +46,20 @@ export class Dashboard {
         ["Jitter", number(v.jitterMs, " ms")], ["Frames dropped", number(v.framesDropped, "", 0)],
         ["Jitter buffer / decode", `${number(v.jitterBufferMs)} / ${number(v.decodeMs)} ms`],
         ["Packet to frame", number(v.processingMs, " ms")], ["Freezes", number(v.freezes, "", 0)],
-        // Quantizer is pixelation itself; corrupted frames are the torn, smeared kind of glitch.
-        ["Quantizer (blockiness)", number(v.qp, "", 0)], ["Corrupted frames", number(v.corrupted, "", 0)],
+        // Quantizer is pixelation itself. Browsers rarely report it for hardware decoding, so the encoder's own
+        // value from the host stands in. Undecoded frames are received minus decoded over the last second, which is
+        // usually one frame still in flight rather than damage.
+        ["Quantizer (blockiness)", typeof v.qp === "number" ? number(v.qp, "", 0) : number(h.qp_mean, "", 0)],
+        ["Undecoded frames", number(v.corrupted, "", 0)],
         ["Decoder", text(v.decoder)], ["NACK / PLI", `${number(v.nack,"",0)} / ${number(v.pli,"",0)}`],
       ]],
       ["Host pipeline", [
         ["Capture", number(h.capture_fps, " FPS")], ["Backend", text(h.capture_backend)],
         ["Encoder", text(h.encoder)], ["Encode", number(h.encode_ms_mean, " ms")],
+        ["Stream", typeof h.stream_fps === "number" && typeof h.stream_height === "number"
+          ? `${h.stream_height}p at ${h.stream_fps} FPS` : "n/a"],
+        ["Bitrate / target", `${number(typeof h.bitrate === "number" ? h.bitrate / 1e6 : null, "", 1)} / ${
+          number(typeof h.target_bitrate === "number" ? h.target_bitrate / 1e6 : null, " Mbps", 1)}`],
         ["Frame wait / present to encoded", `${number(h.acquire_delay_ms_mean)} / ${number(h.source_to_encoded_ms_mean)} ms`],
         ["Encode p95 / p99", `${number(h.encode_ms_p95)} / ${number(h.encode_ms_p99)} ms`],
         ["Video path", text(h.video_path)], ["GPU", text(h.gpu)],

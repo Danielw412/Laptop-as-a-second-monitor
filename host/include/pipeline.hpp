@@ -4,6 +4,7 @@
 #include "display_query.hpp"
 #include "metrics.hpp"
 #include "settings.hpp"
+#include "synthetic.hpp"
 #include "transport.hpp"
 #include <atomic>
 #include <functional>
@@ -18,9 +19,17 @@ struct EngineConfig {
     unsigned fps = 60;
     BitratePlan bitrate = bitratePlan(QualityPreset::Balanced);
     bool pattern = false, synthetic = false, flushGpu = false, allowPrimary = false;
+    SyntheticContent syntheticContent = SyntheticContent::Bar; // What --synthetic and --pattern draw
+    unsigned scrollSpeed = 4;                                  // Scrolling text: pixels per frame
+    EncoderTuning encoder;  // Rate control and quantizer limits (the app runs the defaults)
     unsigned seconds = 0;   // Bench: stop after this long (0 = until stopped)
     unsigned bitrateSwitchSeconds = 0; // Bench: alternate the encoder bitrate between plan min/max every N s
     std::string csvPath;    // Bench: per-second CSV
+    // Bench: the exact access units handed to the network as an Annex B file (plus <name>.jsonl, one line per unit),
+    // and with recordSourceEvery N, every Nth source frame's NV12 surface as the encoder read it (<name>.nv12 plus
+    // <name>.source.jsonl), so the encoded stream can be decoded offline and compared with its input.
+    std::string recordPath;
+    unsigned recordSourceEvery = 0;
     std::string signalingUrl, hostSecret;
     TransportTestOptions test;
     DisplayMatcher matcher; // Required: how to find the display to capture
@@ -79,6 +88,11 @@ class StreamingEngine {
     std::thread thread_;
     std::atomic<bool> stop_{false}, running_{false}, kick_{false}, rotate_{false}, keyframe_{false};
     std::atomic<CaptureBackend> resolved_{CaptureBackend::Auto};
+    // Stall watchdog: the engine thread stamps heartbeat_ every loop iteration and names what it is doing in stage_;
+    // a separate thread logs when an iteration takes seconds (a blocked driver call, a stuck encoder) and in which
+    // stage, because while it is stuck, signaling and keyframe requests wait with it.
+    std::atomic<int64_t> heartbeat_{0};
+    std::atomic<const char *> stage_{"starting"};
     mutable std::mutex snapshotMutex_;
     MetricsSnapshot snapshot_;
     std::unique_ptr<ITransport> transport_;

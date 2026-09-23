@@ -1,3 +1,4 @@
+#include "logging.hpp"
 #include "platform.hpp"
 #include <atomic>
 #include <deque>
@@ -152,14 +153,17 @@ class MfEncoder final : public IEncoder {
         ComPtr<IMFAsyncCallback> released;
     };
     std::vector<Slot> slots_;
-    bool idr_ = true;
+    bool idr_ = true, attributesLogged_ = false;
     std::vector<uint8_t> headers_;
     ComPtr<IMFSample> outputSample_;
     ComPtr<IMFMediaBuffer> outputBuffer_;
     DWORD outputCapacity_ = 0, outputAlignment_ = 0;
+    // Options the encoder refused at configuration time, for the one line each build logs: an option the encoder
+    // silently ignores is exactly how a stream ends up running with settings nobody chose.
+    std::vector<std::string> refused_;
     bool setting(const GUID &key, ULONG value, bool boolean, const char *label, bool force = false) {
         if (!codec_ || codec_->IsSupported(&key) != S_OK || (!force && codec_->IsModifiable(&key) != S_OK)) {
-            std::cout << "Encoder option unsupported: " << label << '\n';
+            refused_.push_back(std::string(label) + " (unsupported)");
             return false;
         }
         VARIANT v;
@@ -172,8 +176,36 @@ class MfEncoder final : public IEncoder {
             v.ulVal = value;
         }
         HRESULT hr = codec_->SetValue(&key, &v);
-        std::cout << "Encoder option " << label << ": " << (SUCCEEDED(hr) ? "accepted" : "rejected") << '\n';
+        if (FAILED(hr))
+            refused_.push_back(std::string(label) + " (rejected)");
         return SUCCEEDED(hr);
+    }
+    std::optional<uint64_t> read(const GUID &key) const {
+        if (!codec_ || codec_->IsSupported(&key) != S_OK)
+            return std::nullopt;
+        VARIANT v;
+        VariantInit(&v);
+        if (FAILED(codec_->GetValue(&key, &v)))
+            return std::nullopt;
+        std::optional<uint64_t> out;
+        switch (v.vt) {
+        case VT_UI4:
+            out = v.ulVal;
+            break;
+        case VT_UI8:
+            out = v.ullVal;
+            break;
+        case VT_I4:
+            out = uint64_t(std::max<LONG>(0, v.lVal));
+            break;
+        case VT_BOOL:
+            out = v.boolVal ? 1 : 0;
+            break;
+        default:
+            break;
+        }
+        VariantClear(&v);
+        return out;
     }
     void pump() {
         std::deque<SignalledEvent> events;
@@ -247,7 +279,7 @@ class MfEncoder final : public IEncoder {
 
   public:
     MfEncoder(Device &device, IMFActivate *activation, unsigned width, unsigned height, unsigned fps,
-              uint32_t bitrate, unsigned maxInFlight)
+              uint32_t bitrate, unsigned maxInFlight, const EncoderTuning &tuning)
         : activation_(activation), fps_(fps), maxInFlight_(std::max(1u, maxInFlight)) {
         if (!signals_->event)
             throw std::runtime_error("Encoder event");
@@ -285,8 +317,22 @@ class MfEncoder final : public IEncoder {
         setting(CODECAPI_AVLowLatencyMode, TRUE, true, "low latency");
         setting(CODECAPI_AVEncCommonRealTime, TRUE, true, "realtime");
         setting(CODECAPI_AVEncMPVDefaultBPictureCount, 0, false, "zero B frames");
-        setting(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR, false, "CBR");
-        setting(CODECAPI_AVEncMPVGOPSize, fps * kGopSeconds, false, "GOP");
+        static const ULONG modes[] = {eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+                                      eAVEncCommonRateControlMode_LowDelayVBR, eAVEncCommonRateControlMode_Quality};
+        setting(CODECAPI_AVEncCommonRateControlMode, modes[size_t(tuning.rateControl)], false,
+                rateControlName(tuning.rateControl), true);
+        setting(CODECAPI_AVEncCommonMeanBitRate, bitrate, false, "mean bitrate", true);
+        if (tuning.rateControl == RateControl::PeakVbr || tuning.rateControl == RateControl::LowDelayVbr)
+            setting(CODECAPI_AVEncCommonMaxBitRate, ULONG(uint64_t(bitrate) * tuning.peakPercent / 100), false,
+                    "peak bitrate", true);
+        if (tuning.bufferMs)
+            setting(CODECAPI_AVEncCommonBufferSize, ULONG(uint64_t(bitrate) * *tuning.bufferMs / 1000), false,
+                    "buffer size", true);
+        if (tuning.maxQp)
+            setting(CODECAPI_AVEncVideoMaxQP, *tuning.maxQp, false, "max QP", true);
+        if (tuning.minQp)
+            setting(CODECAPI_AVEncVideoMinQP, *tuning.minQp, false, "min QP", true);
+        setting(CODECAPI_AVEncMPVGOPSize, tuning.gopFrames ? tuning.gopFrames : fps * kGopSeconds, false, "GOP");
         ComPtr<IMFMediaType> out;
         check(MFCreateMediaType(&out), "Output type");
         check(out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "Video type");
@@ -335,6 +381,28 @@ class MfEncoder final : public IEncoder {
     }
     const std::string &name() const override {
         return name_;
+    }
+    std::string configuration() const override {
+        auto value = [&](const GUID &key) {
+            const auto v = read(key);
+            return v ? std::to_string(*v) : std::string("n/a");
+        };
+        static const char *const modeNames[] = {"cbr",           "peak-vbr",   "unconstrained-vbr",   "quality",
+                                                "low-delay-vbr", "global-vbr", "global-low-delay-vbr"};
+        const auto mode = read(CODECAPI_AVEncCommonRateControlMode);
+        std::string text =
+            "rate control " + (mode && *mode < std::size(modeNames) ? std::string(modeNames[*mode]) : std::string("n/a")) +
+            ", mean " + value(CODECAPI_AVEncCommonMeanBitRate) + " bps, peak " + value(CODECAPI_AVEncCommonMaxBitRate) +
+            " bps, buffer " + value(CODECAPI_AVEncCommonBufferSize) + " bits, QP " + value(CODECAPI_AVEncVideoMinQP) +
+            "-" + value(CODECAPI_AVEncVideoMaxQP) + ", GOP " + value(CODECAPI_AVEncMPVGOPSize) + ", B frames " +
+            value(CODECAPI_AVEncMPVDefaultBPictureCount) + ", low latency " + value(CODECAPI_AVLowLatencyMode) +
+            ", quality/speed " + value(CODECAPI_AVEncCommonQualityVsSpeed);
+        if (!refused_.empty()) {
+            text += " | not applied:";
+            for (auto &r : refused_)
+                text += " " + r;
+        }
+        return text;
     }
     size_t pending() const override {
         return pending_.size();
@@ -441,6 +509,36 @@ class MfEncoder final : public IEncoder {
                 continue;
             Encoded frame;
             check(sample->GetSampleTime(&frame.timestamp), "Encoded timestamp");
+            if (!attributesLogged_) {
+                // Once per encoder: which per-frame facts this encoder attaches to its output (QP, picture type...).
+                attributesLogged_ = true;
+                UINT32 n = 0;
+                sample->GetCount(&n);
+                std::string list;
+                for (UINT32 i = 0; i < n; ++i) {
+                    GUID key{};
+                    PROPVARIANT value;
+                    PropVariantInit(&value);
+                    if (SUCCEEDED(sample->GetItemByIndex(i, &key, &value))) {
+                        wchar_t text[64];
+                        StringFromGUID2(key, text, 64);
+                        list += " " + utf8(text) + "=" +
+                                (value.vt == VT_UI4 ? std::to_string(value.ulVal)
+                                 : value.vt == VT_UI8 ? std::to_string(value.uhVal.QuadPart)
+                                                      : "vt" + std::to_string(value.vt));
+                    }
+                    PropVariantClear(&value);
+                }
+                logInfo("Encoder output sample attributes:" + list);
+            }
+            // The frame's QP as the encoder chose it (Intel keeps slice_qp_delta at 0 and varies QP per
+            // macroblock, so the slice header alone says nothing). Bits 0-15 hold the luma QP.
+            if (UINT64 qp = 0; SUCCEEDED(sample->GetUINT64(MFSampleExtension_VideoEncodeQP, &qp)))
+                frame.qp = int(qp & 0xffff);
+            else if (UINT32 qp32 = 0; SUCCEEDED(sample->GetUINT32(MFSampleExtension_VideoEncodeQP, &qp32)))
+                frame.qp = int(qp32 & 0xffff);
+            if (frame.qp && (*frame.qp < 0 || *frame.qp > 51))
+                frame.qp.reset();
             UINT32 key = 0;
             sample->GetUINT32(MFSampleExtension_CleanPoint, &key);
             frame.keyframe = key != 0;
@@ -487,8 +585,32 @@ class MfEncoder final : public IEncoder {
         return setting(CODECAPI_AVEncCommonMeanBitRate, b, false, "bitrate");
     }
 };
+RateControl parseRateControl(const std::string &s) {
+    if (s == "cbr")
+        return RateControl::Cbr;
+    if (s == "vbr" || s == "peak-vbr")
+        return RateControl::PeakVbr;
+    if (s == "low-delay-vbr")
+        return RateControl::LowDelayVbr;
+    if (s == "quality")
+        return RateControl::Quality;
+    throw std::runtime_error("Rate control must be cbr, vbr, low-delay-vbr or quality");
+}
+const char *rateControlName(RateControl r) {
+    switch (r) {
+    case RateControl::PeakVbr:
+        return "peak-vbr";
+    case RateControl::LowDelayVbr:
+        return "low-delay-vbr";
+    case RateControl::Quality:
+        return "quality";
+    default:
+        return "cbr";
+    }
+}
 std::unique_ptr<IEncoder> hardwareEncoder(Device &device, const Display &display, unsigned width,
-                                          unsigned height, unsigned fps, uint32_t bitrate, unsigned maxInFlight) {
+                                          unsigned height, unsigned fps, uint32_t bitrate, unsigned maxInFlight,
+                                          const EncoderTuning &tuning) {
     ComPtr<IMFAttributes> attrs;
     check(MFCreateAttributes(&attrs, 1), "Encoder filter");
     UINT64 luid =
@@ -510,9 +632,9 @@ std::unique_ptr<IEncoder> hardwareEncoder(Device &device, const Display &display
     CoTaskMemFree(acts);
     for (auto &a : candidates) {
         try {
-            return std::make_unique<MfEncoder>(device, a.Get(), width, height, fps, bitrate, maxInFlight);
+            return std::make_unique<MfEncoder>(device, a.Get(), width, height, fps, bitrate, maxInFlight, tuning);
         } catch (const std::exception &e) {
-            std::cerr << "Hardware encoder rejected: " << e.what() << '\n';
+            logWarning(std::string("Hardware encoder rejected: ") + e.what());
             a->ShutdownObject();
         }
     }

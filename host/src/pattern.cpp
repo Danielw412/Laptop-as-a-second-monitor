@@ -1,6 +1,6 @@
 #include "pattern.hpp"
 namespace lm {
-Pattern::Pattern(const Display &display) {
+Pattern::Pattern(const Display &display, SyntheticContent content) : content_(content) {
     HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!ready)
         throw std::runtime_error("Pattern event");
@@ -25,6 +25,7 @@ void Pattern::run(const Display &display, HANDLE ready, std::string &error) {
     ComPtr<ID3D11DeviceContext1> context;
     ComPtr<IDXGISwapChain1> swapchain;
     ComPtr<ID3D11RenderTargetView> target;
+    std::unique_ptr<SyntheticSource> text;
     try {
         WNDCLASSW wc{};
         wc.lpfnWndProc = DefWindowProcW;
@@ -57,6 +58,8 @@ void Pattern::run(const Display &display, HANDLE ready, std::string &error) {
         ComPtr<ID3D11Texture2D> backbuffer;
         check(swapchain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)), "Pattern backbuffer");
         check(device->CreateRenderTargetView(backbuffer.Get(), nullptr, &target), "Pattern render target");
+        if (content_ == SyntheticContent::Scroll)
+            text = std::make_unique<SyntheticSource>(device.Get(), context.Get(), width, height, content_);
     } catch (const std::exception &e) {
         error = e.what();
         if (window)
@@ -72,12 +75,19 @@ void Pattern::run(const Display &display, HANDLE ready, std::string &error) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        float background[]{.04f, .08f, .12f, 1};
-        float foreground[]{.2f, .8f, .5f, 1};
-        context->ClearRenderTargetView(target.Get(), background);
-        LONG x = (frame++ * 13) % width;
-        D3D11_RECT rect{x, LONG(height / 4), std::min<LONG>(x + 240, width), LONG(height * 3 / 4)};
-        context->ClearView(target.Get(), foreground, &rect, 1);
+        if (text) {
+            ComPtr<ID3D11Texture2D> backbuffer;
+            if (FAILED(swapchain->GetBuffer(0, IID_PPV_ARGS(&backbuffer))))
+                break;
+            text->render(backbuffer.Get(), frame++);
+        } else {
+            float background[]{.04f, .08f, .12f, 1};
+            float foreground[]{.2f, .8f, .5f, 1};
+            context->ClearRenderTargetView(target.Get(), background);
+            LONG x = (frame++ * 13) % width;
+            D3D11_RECT rect{x, LONG(height / 4), std::min<LONG>(x + 240, width), LONG(height * 3 / 4)};
+            context->ClearView(target.Get(), foreground, &rect, 1);
+        }
         // Vsync: exactly one new desktop frame per refresh of the selected display.
         if (FAILED(swapchain->Present(1, 0)))
             break;

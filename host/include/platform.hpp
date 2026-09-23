@@ -141,6 +141,7 @@ struct Encoded {
     int64_t presented{}; // Source presentation time carried through the encoder (0 if unknown)
     bool keyframe{};
     double latencyMs{};
+    std::optional<int> qp; // Frame QP when the encoder reports one on its output (MFSampleExtension_VideoEncodeQP)
     // Host-clock bookkeeping. `matched` is false when the output's sample time did not identify a submission, in
     // which case latencyMs and trace are empty rather than guessed.
     bool matched = false;
@@ -162,11 +163,27 @@ class IEncoder {
     virtual void keyframe() = 0;
     virtual bool bitrate(uint32_t) = 0;
     virtual const std::string &name() const = 0;
+    /// What the encoder reports for the settings that shape its output (rate control, bitrate, buffer, QP limits,
+    /// GOP), read back after configuration, so a log shows what it actually runs with rather than what was asked.
+    virtual std::string configuration() const = 0;
     virtual size_t pending() const = 0;
     /// Signalled whenever the encoder has news: output ready, input wanted, or an input surface released.
     virtual HANDLE event() const = 0;
 };
+/// How the encoder spends its bits. CBR holds every frame to rate/fps (with a small buffer, a burst of change is
+/// quantized hard); peak-constrained VBR lets a changed frame borrow from still ones up to a peak rate.
+enum class RateControl { Cbr, PeakVbr, LowDelayVbr, Quality };
+RateControl parseRateControl(const std::string &);
+const char *rateControlName(RateControl);
+struct EncoderTuning {
+    RateControl rateControl = RateControl::Cbr;
+    unsigned peakPercent = 150;          // PeakVbr: peak bitrate as a percentage of the mean
+    std::optional<unsigned> bufferMs;    // VBV/HRD buffer as time at the mean bitrate; empty = encoder default
+    std::optional<unsigned> maxQp, minQp; // Quantizer limits; empty = encoder default
+    unsigned gopFrames = 0;              // 0: effectively never on its own; keyframes are then forced on a timer
+};
 /// maxInFlight bounds how many frames may be inside the encoder at once (queue depth, and so added latency).
 std::unique_ptr<IEncoder> hardwareEncoder(Device &, const Display &, unsigned width, unsigned height,
-                                          unsigned fps, uint32_t bitrate = 8000000, unsigned maxInFlight = 2);
+                                          unsigned fps, uint32_t bitrate = 8000000, unsigned maxInFlight = 2,
+                                          const EncoderTuning &tuning = {});
 } // namespace lm

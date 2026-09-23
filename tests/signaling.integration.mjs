@@ -16,7 +16,8 @@ async function connect(path) {
   const queue = [];
   const waiters = [];
   ws.on("message", (raw) => {
-    const m = JSON.parse(raw.toString());
+    const text = raw.toString();
+    const m = text === "pong" ? { type: "pong" } : JSON.parse(text);
     const i = waiters.findIndex((w) => w.type === m.type);
     if (i >= 0) {
       const [w] = waiters.splice(i, 1);
@@ -66,9 +67,11 @@ try {
   impostor.send(hostAuth("0".repeat(64)));
   assert.equal((await impostor.next("error")).code, "authentication");
 
-  const host = await connect(`/room/${room}`);
+  let host = await connect(`/room/${room}`);
   host.send(hostAuth());
-  assert.equal((await host.next("authenticated")).role, "host");
+  const hostAuthenticated = await host.next("authenticated");
+  assert.equal(hostAuthenticated.role, "host");
+  assert.deepEqual(hostAuthenticated.features, ["resume", "heartbeat"]);
 
   // No code registered yet: pairing is rejected before it reaches the room.
   assert.deepEqual(await pair(newCode()), { status: 404, error: "invalid-code" });
@@ -108,6 +111,27 @@ try {
   assert.deepEqual(await host.next("answer"), answer);
   const ice = { type: "ice", generation: h.generation, candidate: "candidate:1 1 UDP 1 127.0.0.1 9000 typ host", mid: "video" };
   host.send(ice);
+  assert.deepEqual(await viewer.next("ice"), ice);
+
+  // Heartbeat: the runtime answers "ping" with "pong".
+  viewer.ws.send("ping");
+  assert.equal((await viewer.next("pong")).type, "pong");
+
+  // Resume: both peers report their media connection up; the host's WebSocket drops and comes back still holding
+  // it. The worker hands back the same generation with resume: true, so nobody renegotiates.
+  viewer.send({ type: "state", generation: h.generation, live: true });
+  host.send({ type: "state", generation: h.generation, live: true });
+  await new Promise((r) => setTimeout(r, 200));
+  host.ws.close();
+  await viewer.next("peer-left");
+  host = await connect(`/room/${room}`);
+  host.send({ ...hostAuth(), live: h.generation });
+  await host.next("authenticated");
+  const resumedHost = await host.next("ready"), resumedViewer = await viewer.next("ready");
+  assert.equal(resumedHost.generation, h.generation);
+  assert.equal(resumedHost.resume, true);
+  assert.equal(resumedViewer.resume, true);
+  host.send(ice); // Relays continue on the kept generation
   assert.deepEqual(await viewer.next("ice"), ice);
 
   // Viewer reload: the resume token works without a code, even after the code set changed.
@@ -177,7 +201,7 @@ try {
   }
   assert.ok(limited, "expected rate limiting after repeated wrong codes");
   console.log(
-    "Signaling integration passed: host credential auth, code pairing, normalization, single-use tickets, one-viewer limit, rotation overlap, resume token, kick, roles, host replacement, host-unavailable, size limits, throttling.",
+    "Signaling integration passed: host credential auth, code pairing, normalization, single-use tickets, one-viewer limit, rotation overlap, heartbeat, session resume, resume token, kick, roles, host replacement, host-unavailable, size limits, throttling.",
   );
 } finally {
   for (const ws of sockets) ws.close();
